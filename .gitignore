@@ -153,3 +153,7 @@ dmypy.json
 *.whl
 *.th
 *.onnx
+
+# current files
+debug/ 
+debug_3D/
