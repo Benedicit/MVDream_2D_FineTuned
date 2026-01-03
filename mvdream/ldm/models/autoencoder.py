@@ -109,6 +109,9 @@ class AutoencoderKL(torch.nn.Module):
         inputs = self.get_input(batch, self.image_key)
         reconstructions, posterior = self(inputs)
 
+        # INSERT loss here
+        # Think about mesh-loss and also point_cloud loss
+
         if optimizer_idx == 0:
             # train encoder+decoder+logvar
             aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,
