@@ -106,7 +106,7 @@ if __name__ == "__main__":
     model.eval()
 
      # Get the pointcloud features properly
-    pointcloud_path = "/home/temp_compute/Benedikt/ShapeDream/data/dataset/bag1.ply"
+    pointcloud_path = "/home/bweiss/Benedikt/ShapeDream/data/dataset/bag1.ply"
     pc_feat = pointNet(pointcloud_path=pointcloud_path, device=args.device)
 
 

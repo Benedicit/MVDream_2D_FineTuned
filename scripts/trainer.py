@@ -17,12 +17,20 @@ from view_renderer import PointRenderer, MeshRendererMVDream
 from tqdm import tqdm
 from ShapeCompletionLoss import ShapeCompletionLoss
 from tester import Tester3D
-
+import pandas as pd
 working_dir = os.path.dirname(os.path.realpath(__file__))
 
 SNAP_DIR = f"{working_dir}/../../snap_gtr"
 OUTPUT_DIR = working_dir + "/../debug"
 MESH_DIR = working_dir + "/../debug_3D"
+
+
+def get_mesh_from_pc(pointcloud_name="bag1.ply"):
+    gso_csv = "/home/bweiss/Benedikt/ShapeDream/data/gso_label_to_mesh.csv"
+    mapping = pd.read_csv(gso_csv)
+    return mapping.loc[mapping["label"] == pointcloud_name, "filename"].iloc[0]
+
+
 
 class LoRATrainer:
     def __init__(self, device, lora_rank, lora_alpha, num_steps=200, model_name="sd-v2.1-base-4view", H=256, W=256, ELEV_DEG=15.0, DIST=2.5, num_views=4):
@@ -56,9 +64,9 @@ class LoRATrainer:
         
         # Define projector properly
         dummy_c = self.model.get_learned_conditioning(["dummy"]).to(self.device)
-        dummy_pointcloud_path = "/home/bweiss/Benedikt/ShapeDream/data/dataset_masked/bag1.ply"
+        self.dummy_pointcloud_path = "/home/bweiss/Benedikt/ShapeDream/data/dataset_masked/bag1.ply"
         with torch.no_grad():
-            pc_feat_dummy = pointNet(pointcloud_path=dummy_pointcloud_path, device=self.device)
+            pc_feat_dummy = pointNet(pointcloud_path=self.dummy_pointcloud_path, device=self.device)
         pc_feat_dim = pc_feat_dummy.shape[-1]
         context_dim = dummy_c.shape[-1]
 
@@ -93,11 +101,13 @@ class LoRATrainer:
         # Get full pointcloud to train against
         points_obj = read_from_plyfile(pointcloud_path)
         verts = torch.tensor(points_obj.vertices, dtype=torch.float32, device=self.device)[:, :3]
+        # Normalization done in rendering
+        """
         verts = verts - verts.mean(0, keepdim=True)
         scale = verts.norm(dim=1).max()
         if scale > 0:
             verts = verts / scale
-
+        """
         renderer = PointRenderer(device=self.device, image_size=self.H, radius=0.015)
         
         return renderer, verts
@@ -119,12 +129,15 @@ class LoRATrainer:
         verts = verts.to(self.device)
         faces = faces.to(self.device)
 
+        # Normalization done in rendering
         # 2. Normalize (centering and scaling)
         # Important: Only move verts; faces just reference the indices
+        """
         verts = verts - verts.mean(0, keepdim=True)
         scale = verts.norm(dim=1).max()
         if scale > 0:
             verts = verts / scale
+        """
 
         # 3. Initialize the Mesh Renderer
         # (Assuming you named the new class MeshRendererMVDream)
@@ -133,8 +146,8 @@ class LoRATrainer:
         # Return renderer, verts, and faces (since the renderer now needs both)
         return renderer, verts, faces, mesh if mesh else None
 
-    def train_with_3D(self, pc_feat, x0 : str, save_train_img=False):
-        renderer, verts, faces, mesh = self.get_renderings_verts_from_file_mesh(x0)
+    def train_with_point_cloud(self, pc_feat, x0 : str, save_train_img=False):
+        renderer, verts = self.get_renderings_verts_from_file_pc(x0)
 
         V = 4
         # get camera and input it into our mesh_renderer
@@ -147,15 +160,32 @@ class LoRATrainer:
         ).to(self.device)
         debug_name = "A bag"  # get_point_cloud_reg(x0)
 
-        imgs = renderer.render_mvdream_views(
-            verts, faces, camera=camera
+        # TODO: Add Depth Map conditioning
+        condition_imgs = renderer.render_mvdream_views(
+            verts, camera=camera
         )
 
+        # Encode conditional images to latent space
+        with torch.no_grad():
+            z_cond = self.model.encode_first_stage(condition_imgs)
+            if hasattr(self.model, "get_first_stage_encoding"):
+                z_cond = self.model.get_first_stage_encoding(z_cond)
+
         if save_train_img:
-            self.save_training_views_grid(imgs=imgs, out_path="debug/" + debug_name + "check" + ".png")
+            self.save_training_views_grid(imgs=condition_imgs, out_path="debug/" + debug_name + "_check_pc" + ".png")
+
+
+        mesh_path = get_mesh_from_pc()
+
+        mesh_renderer, verts_m, faces_m, mesh = self.get_renderings_verts_from_file_mesh(mesh_path)
+
+        target_imgs = mesh_renderer.render_mvdream_views(verts_m, faces_m, camera=camera)
+
+        if save_train_img:
+            self.save_training_views_grid(imgs=target_imgs, out_path="debug/" + debug_name + "_target" + ".png")
 
         with torch.no_grad():
-            z = self.model.encode_first_stage(imgs)
+            z = self.model.encode_first_stage(target_imgs)
             if hasattr(self.model, "get_first_stage_encoding"):
                 z = self.model.get_first_stage_encoding(z)
         V = self.num_views
@@ -163,8 +193,7 @@ class LoRATrainer:
         pc_feat_fixed = pc_feat.detach().to(self.device)
         pc_feats_views = pc_feat_fixed.expand(V, -1)
 
-        V = imgs.shape[0]
-        azims = torch.tensor([0.0, 90.0, 180.0, 270.0], device=self.device)[:V]
+        V = condition_imgs.shape[0]
 
         cam = camera.detach().cpu().numpy().reshape(V, 4, 4)
         centers = cam[:, :3, 3]
@@ -197,22 +226,7 @@ class LoRATrainer:
 
             eps_pred = self.model.apply_model(z_noisy, t, cond)
 
-            os.makedirs("samples", exist_ok=True)
-            obj_name = get_point_cloud_name(pointcloud_path)
-            os.makedirs(obj_name, exist_ok=True)
-
-            imgs_pc = tester.sample_multiview(pointcloud_path=pointcloud_path)
-
-
-            tester.save_4_views(imgs_pc, str(Path(OUTPUT_DIR)/obj_name), dist=2.5, fov_deg=50)
-
-            tester.views_to_3D(obj_name)
-
-            path_to_inferred_mesh = Path(MESH_DIR) / object_name
-
-            generated_mesh = load_objs_as_meshes(path_to_inferred_mesh, device=self.device)
-
-            loss = self.loss_fn(generated_mesh, mesh, eps_pred, noise, deterministic=True)
+            loss = F.mse_loss(eps_pred, noise)
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -243,7 +257,7 @@ class LoRATrainer:
         )
         
         if save_train_img:
-            self.save_training_views_grid(imgs=imgs, out_path="debug/"+debug_name+"check"+".png")
+            self.save_training_views_grid(imgs=imgs, out_path="/home/bweiss/Benedikt/ShapeDream/mvdream_2D/debug/"+debug_name+"check"+".png")
         
         with torch.no_grad():
             z = self.model.encode_first_stage(imgs)

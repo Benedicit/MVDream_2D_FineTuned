@@ -5,7 +5,7 @@ import numpy as np
 from PIL import Image, ImageFilter, ImageOps
 
 from mvdream.model_zoo import build_model
-from mvdream.camera_utils import get_camera
+from mvdream.camera_utils import get_camera, create_camera_to_world_matrix
 from mvdream.ldm.models.diffusion.ddim import DDIMSampler
 
 from lora import add_lora_to_mvdream_unet, LoRALinear
@@ -19,8 +19,9 @@ print(working_dir)
 SNAP_DIR = f"{working_dir}/../../snap_gtr"
 OUTPUT_DIR = working_dir + "/../debug"
 MESH_DIR = working_dir + "/../debug_3D"
+SHAPEDREAM_DIR = f"{working_dir}/../.."
 print(SNAP_DIR)
-sys.path.insert(1, SNAP_DIR+"/..")
+sys.path.insert(1, SHAPEDREAM_DIR)
 from snap_gtr.scripts import inference, prepare_mv
 
 
@@ -238,19 +239,19 @@ class Tester3D:
             # debug: save alpha to inspect
             Image.fromarray(a, "L").save(out_dir / f"_alpha_{i:03d}.png")
 
+            """
             cam = self.camera.detach().cpu().numpy().reshape(V,4,4)
             C_bl = cam[:, :3, 3]
             C_cv = np.stack([C_bl[:, 0], C_bl[:, 2], -C_bl[:, 1]], axis=1)
 
             phi_world = np.degrees(np.arctan2(C_cv[:, 2], C_cv[:, 0]))
             azims_deg = (90.0 - phi_world) % 360.0
-
+            """
         self.write_snapgtr_cameras_from_angles(
             out_dir=str(out_dir),
             fov_deg=fov_deg,
             H=H, W=W,
             elev_deg=self.ELEV_DEG,
-            azims_deg=azims_deg.tolist(),
             radius=dist,
         )
 
@@ -288,7 +289,8 @@ class Tester3D:
         return c2w
 
     def write_snapgtr_cameras_from_angles(self, out_dir: str, fov_deg: float, H: int, W: int,
-                                        elev_deg: float, azims_deg, radius: float):
+                                          elev_deg: float, radius: float,
+                                          azims_deg=[0.0,90.0,180.0,270.0]):
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -300,12 +302,28 @@ class Tester3D:
         # phi_list   = 90 - azimuth
         theta = 90.0 - float(elev_deg)
 
-        for i, az in enumerate(azims_deg):
-            phi = 90.0 - float(az)
+        # Convert Blender → OpenCV coordinate system
+        # Blender: +X right, +Y up, -Z forward
+        # OpenCV:  +X right, +Y down, +Z forward
+        blender_to_cv = np.array([
+            [1, 0, 0, 0],
+            [0, -1, 0, 0],
+            [0, 0, -1, 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
 
-            eye = self._get_cam_pose(theta, phi, radius)
-            c2w = self._get_c2w_opencv(eye, center)
-            w2c = np.linalg.inv(c2w)
+        for i in range(len(azims_deg)):
+            az = azims_deg[i]
+            c2w = create_camera_to_world_matrix(elev_deg, az)
+
+            # Scale translation by radius
+            c2w[:3, 3] *= radius
+            eye = c2w[:3, 3]
+
+            c2w_cv = self._get_c2w_opencv(eye, np.array([0,0,0]))
+
+            # Get w2c for SnapGTR
+            w2c = np.linalg.inv(c2w_cv)
 
             p = out_dir / f"cam_{i:03d}.txt"
             with p.open("w") as f:

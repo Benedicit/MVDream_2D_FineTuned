@@ -12,11 +12,11 @@ SNAP_DIR = f"{working_dir}/../../snap_gtr"
 OUTPUT_DIR = working_dir + "/../debug"
 MESH_DIR = working_dir + "/../debug_3D"
 print(SNAP_DIR)
-sys.path.insert(1, SNAP_DIR+"/..")
 
 def main():
-    pointcloud_path = "/home/temp_compute/Benedikt/ShapeDream/data/dataset_masked/bag1.ply"
+    pointcloud_path = "/home/bweiss/Benedikt/ShapeDream/data/dataset_masked/bag1.ply"
     tester = Tester3D()
+    # first need to load model such that we can sample properly
     #tester.load_model_for_pc(pointcloud_path=pointcloud_path)
 
     #imgs_pc = tester.sample_multiview(pointcloud_path=pointcloud_path)
@@ -35,7 +35,9 @@ def main():
     os.makedirs(obj_name, exist_ok=True)
   
     #"""
-    
+
+    obj_name += "_pc"
+
     #tester.save_4_views(imgs_pc, str(Path(OUTPUT_DIR)/obj_name), dist=2.5, fov_deg=50)
 
     tester.views_to_3D(obj_name)

@@ -22,8 +22,8 @@ class YanxPointNet2Encoder(nn.Module):
 
     def __init__(
         self,
-        ckpt_path: str = "/home/bweiss/Benedikt/ShapeDream/models/Pointnet_Pointnet2_pytorch/log/classification/pointnet2_ssg_wo_normals/checkpoints/best_model.pth",
-        models_root: Optional[str] = "/home/bweiss/Benedikt/ShapeDream/models/Pointnet_Pointnet2_pytorch",
+        ckpt_path: str = "/home/bweiss/Benedikt/ShapeDream/models_pointnet/Pointnet_Pointnet2_pytorch/log/classification/pointnet2_ssg_wo_normals/checkpoints/best_model.pth",
+        models_root: Optional[str] = "/home/bweiss/Benedikt/ShapeDream/models_pointnet/Pointnet_Pointnet2_pytorch",
         model_module: str = "models.pointnet2_cls_ssg",
         num_classes: int = 40,
         normal_channel: bool = False,

@@ -25,7 +25,7 @@ def train_all():
     base_path_unmasked = "/home/bweiss/Benedikt/ShapeDream/data/.gso/Embark_Lunch_Cooler_Blue.obj"
     
     # define which GPU to use
-    trainer = LoRATrainer(device='cuda', lora_rank=32, lora_alpha=8.0, num_steps=400)
+    trainer = LoRATrainer(device='cuda', lora_rank=32, lora_alpha=8.0, num_steps=1000)
     #for file in os.listdir(base_path_masked):
         
     #filename = os.fsdecode(file)
@@ -37,9 +37,9 @@ def train_all():
     with torch.no_grad():
         pc_feat_dummy = pointNet(pointcloud_path=pointcloud_path_masked +"bag1.ply", device=trainer.device)
 
-    trainer.train_single_image(pc_feat_dummy, pointcloud_path_unmasked, save_train_img=True)
+    #trainer.train_single_image(pc_feat_dummy, pointcloud_path_unmasked, save_train_img=True)
 
-    #trainer.train_with_3D(pc_feat_dummy, pointcloud_path_unmasked, save_train_img=True)
+    trainer.train_with_point_cloud(pc_feat_dummy, pointcloud_path_masked + "bag1.ply",save_train_img=True)
 
     trainer.save_weights()
 
