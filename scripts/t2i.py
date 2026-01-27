@@ -12,7 +12,7 @@ from mvdream.ldm.util import instantiate_from_config
 from mvdream.ldm.models.diffusion.ddim import DDIMSampler
 from mvdream.model_zoo import build_model
 
-from test_pointnet_encoder import read_from_plyfile, pointNet, PointFeatProjector
+from test_pointnet_encoder import read_from_plyfile, get_pointnet_features, PointFeatProjector
 
 def set_seed(seed):
     random.seed(seed)
@@ -107,7 +107,7 @@ if __name__ == "__main__":
 
      # Get the pointcloud features properly
     pointcloud_path = "/home/bweiss/Benedikt/ShapeDream/data/dataset/bag1.ply"
-    pc_feat = pointNet(pointcloud_path=pointcloud_path, device=args.device)
+    pc_feat = get_pointnet_features(pointcloud_path=pointcloud_path, device=args.device)
 
 
     tmp_c = model.get_learned_conditioning(["dummy"]).to(device) 

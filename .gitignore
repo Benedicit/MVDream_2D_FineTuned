@@ -157,3 +157,4 @@ dmypy.json
 # current files
 debug/ 
 debug_3D/
+*.png

@@ -20,6 +20,18 @@ from pytorch3d.renderer import (
 )
 from pytorch3d.renderer.cameras import look_at_rotation
 
+
+def normalize_vertices(verts):
+    if not verts.ndim == 3:
+        verts = verts.unsqueeze(0)
+    centroid = verts.mean(dim=1, keepdim=True)  # (B, 1, 3)
+    points = verts - centroid
+    max_dist = torch.sqrt((points ** 2).sum(dim=2)).max(dim=1, keepdim=True)[0]  # (B, 1)
+    points = points / max_dist.unsqueeze(2)
+    return points
+
+
+
 class MVDreamRenderer:
     def __init__(self, device='cuda', image_size=256, fov_deg=50.0):
         self.device = device
@@ -75,7 +87,7 @@ class MVDreamRenderer:
         T_c2w = c2w[:, :3, 3] * dist_scale  # (V,3) camera center in world
 
         up_vectors = R_c2w[:, :, 1]
-        up_list = [tuple(up_vectors[i].cpu().numpy()) for i in range(V)]
+        up_list = [tuple(up_vectors[i].tolist()) for i in range(V)]
 
         R, T = look_at_view_transform(
             eye=T_c2w,
@@ -129,27 +141,44 @@ class PointRenderer(MVDreamRenderer):
             points = points.unsqueeze(0)
         B, N, _ = points.shape
 
-        centroid = points.mean(dim=1, keepdim=True)  # (B, 1, 3)
-        points = points - centroid
-        max_dist = torch.sqrt((points ** 2).sum(dim=2)).max(dim=1, keepdim=True)[0]  # (B, 1)
-        points = points / max_dist.unsqueeze(2)
+        points = normalize_vertices(points)
 
-        # bright pink / magenta (RGB in [0,1])
-        pink = torch.tensor([1.0, 0.2, 0.8], device=self.device)  # tweak as you like
-
-        features = pink.view(1, 1, 3).expand(B, N, 3).contiguous()
-        point_cloud = Pointclouds(points=points, features=features)
-
-        # extend to 4 views per object
-        point_cloud_expanded = point_cloud.extend(4)  # (B*4)
+        # 1. Create Pointcloud (Features/colors not strictly needed for depth)
+        point_cloud = Pointclouds(points=points)
+        point_cloud_expanded = point_cloud.extend(4)
 
         cameras = self._mvdream_to_pytorch3d_cameras(camera, dist_scale=dist_scale, view_order="frbl")
 
-        # renderer output: (B*4, H, W, 3) in [0, 1]
-        rendered_rgb = self.renderer(point_cloud_expanded, cameras=cameras)
+        # 2. Rasterize to get fragments
+        # fragments.zbuf shape: (B*4, H, W, K) where K is points per pixel
+        fragments = self.renderer.rasterizer(point_cloud_expanded, cameras=cameras)
 
-        out = rendered_rgb.permute(0, 3, 1, 2) * 2.0 - 1.0
+        # Get the depth of the closest point for each pixel
+        depth = fragments.zbuf[..., 0]
 
+        # Mask for background (PyTorch3D uses -1 for empty pixels in point rasterization)
+        mask = (fragments.idx[..., 0] > -1)
+
+        # 3. Normalize Depth to [0, 1]
+        valid_depths = depth[mask]
+        if valid_depths.numel() > 0:
+            min_d, max_d = valid_depths.min(), valid_depths.max()
+            depth_norm = (depth - min_d) / (max_d - min_d + 1e-6)
+        else:
+            depth_norm = torch.zeros_like(depth)
+
+        # 4. Apply Jet Colormap (Map 0.0=Near to Blue, 1.0=Far to Red)
+        x = depth_norm
+        r = 1 - x
+        g = torch.zeros_like(x)
+        b = x
+        depth_rgb = torch.stack([r, g, b], dim=-1)
+
+        # 5. Background and Range Formatting
+        depth_rgb[~mask] = 1.0  # White background
+
+        # Return in shape (B*4, 3, H, W) and range [-1, 1]
+        out = depth_rgb.permute(0, 3, 1, 2) * 2.0 - 1.0
         return out
 
 
@@ -161,6 +190,7 @@ class MeshRendererMVDream(MVDreamRenderer):
             image_size=image_size,
             blur_radius=0.0, 
             faces_per_pixel=1,
+            bin_size=None,
         )
 
         # Simple ambient lighting to keep the color uniform (like your PC version)
@@ -181,17 +211,25 @@ class MeshRendererMVDream(MVDreamRenderer):
         B, Nverts, _ = verts.shape
         _, Nfaces, _ = faces.shape
         # Normalize vertices: center and scale to unit sphere
-        center = verts.mean(dim=1, keepdim=True)  # (B, 1, 3)
-        verts = verts - center
-        max_dist = torch.sqrt((verts ** 2).sum(dim=2)).max(dim=1, keepdim=True)[0]  # (B, 1)
-        verts = verts / max_dist.unsqueeze(2)
+        verts = normalize_vertices(verts)
 
         # sanity
         assert faces.max() < Nverts, (faces.max().item(), Nverts)
+        frequency = 6.0
+        v_sine = (torch.sin(verts * frequency) + 1.0) * 0.5  # Range [0, 1]
+        #v_sine_shift = (torch.sin(verts * frequency + torch.pi / 4) + 1.0) * 0.5  # Range [0, 1]
 
-        pink = torch.tensor([1.0, 0.2, 0.8], device=self.device)
-        verts_rgb = pink.view(1, 1, 3).expand(B, Nverts, 3).contiguous()
+        v_combined = v_sine
+        low_bound = 35.0 / 255.0
+        high_bound = 160.0 / 255.0
+
+        verts_rgb = low_bound + (high_bound - low_bound) * v_combined
+
+        # Create texture: x->R, y->G, z->B happens automatically
+        # because verts_rgb is ordered (x, y, z) and color channels are (R, G, B)
         textures = TexturesVertex(verts_features=verts_rgb)
+
+        # --- CHANGE END ---
 
         mesh = Meshes(verts=verts, faces=faces, textures=textures)
 
@@ -200,9 +238,8 @@ class MeshRendererMVDream(MVDreamRenderer):
 
         mesh_expanded = mesh.extend(Vviews)
 
+        # Use the standard renderer to visualize the texture
         rendered = self.renderer(mesh_expanded, cameras=cameras)
-        alpha = rendered[..., 3]
-        print("alpha max:", alpha.max().item())  # keep until you see >0
 
         rgb = rendered[..., :3]
         out = rgb.permute(0, 3, 1, 2) * 2.0 - 1.0
