@@ -82,7 +82,7 @@ with torch.no_grad():
     eps = model.apply_model(noise, t, cond=cond)
 ```
 
-
+---
 ## Acknowledgement
 This repository is heavily based on [Stable Diffusion](https://huggingface.co/stabilityai/stable-diffusion-2-1-base). We would like to thank the authors of these work for publicly releasing their code.
 
