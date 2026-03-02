@@ -1,5 +1,7 @@
 import torch
 import math
+import os
+os.environ["PYTORCH3D_IGNORE_BIN_SIZE_WARNING"] = "1"
 from pytorch3d.structures import Pointclouds
 from pytorch3d.renderer import (
     PointsRasterizationSettings,
@@ -190,7 +192,7 @@ class MeshRendererMVDream(MVDreamRenderer):
             image_size=image_size,
             blur_radius=0.0, 
             faces_per_pixel=1,
-            bin_size=None,
+            bin_size=0,
         )
 
         # Simple ambient lighting to keep the color uniform (like your PC version)
@@ -202,7 +204,7 @@ class MeshRendererMVDream(MVDreamRenderer):
             shader=SoftPhongShader(device=device, lights=lights)).to(device)
 
     @torch.no_grad()
-    def render_mvdream_views(self, verts, faces, camera, dist_scale=2.5):
+    def render_mvdream_views(self, verts, faces, camera, dist_scale=2.5, interpolation="sine", mesh=None):
         if verts.ndim == 2:
             verts = verts.unsqueeze(0)   # (1, N, 3)
         if faces.ndim == 2:
@@ -211,27 +213,27 @@ class MeshRendererMVDream(MVDreamRenderer):
         B, Nverts, _ = verts.shape
         _, Nfaces, _ = faces.shape
         # Normalize vertices: center and scale to unit sphere
-        verts = normalize_vertices(verts)
 
-        # sanity
-        assert faces.max() < Nverts, (faces.max().item(), Nverts)
-        frequency = 6.0
-        v_sine = (torch.sin(verts * frequency) + 1.0) * 0.5  # Range [0, 1]
-        #v_sine_shift = (torch.sin(verts * frequency + torch.pi / 4) + 1.0) * 0.5  # Range [0, 1]
+        if not mesh or mesh.textures is None:
+            verts_n = normalize_vertices(verts)
 
-        v_combined = v_sine
-        low_bound = 35.0 / 255.0
-        high_bound = 160.0 / 255.0
+            assert faces.max() < Nverts, (faces.max().item(), Nverts)
+            if interpolation == "sine":
+                frequency = 6.0
+                v_combined = (torch.sin(verts_n * frequency) + 1.0) * 0.5  # Range [0, 1]
+            #v_sine_shift = (torch.sin(verts * frequency + torch.pi / 4) + 1.0) * 0.5  # Range [0, 1]
+            else:
+                # Fallback to linear
+                v_combined = (verts_n + 1.0) * 0.5
+            low_bound = 35.0 / 255.0
+            high_bound = 160.0 / 255.0
 
-        verts_rgb = low_bound + (high_bound - low_bound) * v_combined
+            verts_rgb = low_bound + (high_bound - low_bound) * v_combined
 
-        # Create texture: x->R, y->G, z->B happens automatically
-        # because verts_rgb is ordered (x, y, z) and color channels are (R, G, B)
-        textures = TexturesVertex(verts_features=verts_rgb)
+            # Create texture: x->R, y->G, z->B happens automatically
+            textures = TexturesVertex(verts_features=verts_rgb)
 
-        # --- CHANGE END ---
-
-        mesh = Meshes(verts=verts, faces=faces, textures=textures)
+            mesh = Meshes(verts=verts_n, faces=faces, textures=textures)
 
         cameras = self._mvdream_to_pytorch3d_cameras(camera, dist_scale=dist_scale, view_order="frbl")
         Vviews = cameras.R.shape[0]

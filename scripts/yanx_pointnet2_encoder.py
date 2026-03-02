@@ -6,8 +6,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-#models_root = "/home/temp_compute/Benedikt/ShapeDream/models/Pointnet_Pointnet2_pytorch/models"
-#ckpt_path = "/home/temp_compute/Benedikt/ShapeDream/models/Pointnet_Pointnet2_pytorch/log/sem_seg/pointnet2_sem_seg/checkpoints/best_model.pth"
+working_dir = os.path.dirname(os.path.abspath(__file__))
 
 class YanxPointNet2Encoder(nn.Module):
     """
@@ -22,8 +21,8 @@ class YanxPointNet2Encoder(nn.Module):
 
     def __init__(
         self,
-        ckpt_path: str = "/home/bweiss/Benedikt/ShapeDream/models_pointnet/Pointnet_Pointnet2_pytorch/log/classification/pointnet2_ssg_wo_normals/checkpoints/best_model.pth",
-        models_root: Optional[str] = "/home/bweiss/Benedikt/ShapeDream/models_pointnet/Pointnet_Pointnet2_pytorch",
+        ckpt_path: str = f"{working_dir}/../../models_pointnet/Pointnet_Pointnet2_pytorch/log/classification/pointnet2_ssg_wo_normals/checkpoints/best_model.pth",
+        models_root: Optional[str] = f"{working_dir}/../../models_pointnet/Pointnet_Pointnet2_pytorch",
         model_module: str = "models.pointnet2_cls_ssg",
         num_classes: int = 40,
         normal_channel: bool = False,

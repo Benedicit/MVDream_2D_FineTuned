@@ -11,8 +11,9 @@ from yanx_pointnet2_encoder import YanxPointNet2Encoder
 import re
 from view_renderer import normalize_vertices
 
-test_file = "../data/dataset/bag1.ply"
-data_directory = "../data/dataset"
+working_dir = os.path.dirname(os.path.abspath(__file__))
+test_file = f"{working_dir}/../../data/dataset/bag1.ply"
+data_directory = f"{working_dir}/../../data/dataset"
 
 def get_point_cloud_name(file):
     # get name from file name such that we can input it into model properly
@@ -134,8 +135,8 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     encoder = YanxPointNet2Encoder(
-        ckpt_path="/home/bweiss/Benedikt/ShapeDream/models/Pointnet_Pointnet2_pytorch/log/classification/pointnet2_ssg_wo_normals/checkpoints/best_model.pth",
-        models_root="/home/bweiss/Benedikt/ShapeDream/models/Pointnet_Pointnet2_pytorch/models",
+        ckpt_path=f"{working_dir}/../../models_pointnet/Pointnet_Pointnet2_pytorch/log/classification/pointnet2_ssg_wo_normals/checkpoints/best_model.pth",
+        models_root=f"{working_dir}/../../models_pointnet/Pointnet_Pointnet2_pytorch/models",
         normal_channel=False,
         out_dim=256,
         device=device,

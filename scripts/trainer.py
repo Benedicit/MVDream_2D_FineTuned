@@ -1,5 +1,6 @@
 import math
 import os
+from pathlib import Path
 import torch
 import random
 import torch.nn.functional as F
@@ -16,25 +17,23 @@ from lora import add_lora_to_mvdream_unet, LoRALinear
 from test_pointnet_encoder import read_from_plyfile, get_pointnet_features, PointFeatProjector, get_point_cloud_name, get_point_cloud_name_reg
 from view_renderer import PointRenderer, MeshRendererMVDream
 from tqdm import tqdm
-from ShapeCompletionLoss import ShapeCompletionLoss
 from tester import Tester3D
 import pandas as pd
-from depth_map_encoder import DepthViTTokenEncoder
 from tester import Tester3D
 from mvdream.ldm.models.diffusion.ddim import DDIMSampler
-working_dir = os.path.dirname(os.path.realpath(__file__))
+
+working_dir = os.path.dirname(os.path.abspath(__file__))
 
 from yanx_pointnet2_encoder import YanxPointNet2Encoder
 
 SNAP_DIR = f"{working_dir}/../../snap_gtr"
-OUTPUT_DIR = working_dir + "/../debug"
-MESH_DIR = working_dir + "/../debug_3D"
+OUTPUT_DIR = f"{working_dir}/../debug"
+MESH_DIR = f"{working_dir}/../debug_3D"
 
-gso_csv = "/home/bweiss/Benedikt/ShapeDream/data/gso_label_to_mesh.csv"
-shapenet_csv = "/home/bweiss/Benedikt/ShapeDream/data/shapenet_label_to_mesh.csv"
+gso_csv = f"f{working_dir}/../../data/gso_label_to_mesh.csv"
+shapenet_csv = f"{working_dir}/../../data/shapenet_label_to_mesh.csv"
 mapping_gso = pd.read_csv(gso_csv)
 mapping_shapenet = pd.read_csv(shapenet_csv)
-
 
 
 def get_mesh_from_pc(pointcloud_name="bag1.ply"):
@@ -73,6 +72,61 @@ def masked_l1(pred_imgs, gt_imgs, mask, eps=1e-6):
     den = mask.sum() + eps
     return num / den
 
+
+def save_training_views_grid(imgs, out_path, pad=16):
+    """
+    imgs: (V,3,H,W) in [-1,1]
+    """
+    imgs_np = (0.5 * (imgs + 1.0)).clamp(0,1)
+    imgs_np = (imgs_np.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
+
+    V, H, W, C = imgs_np.shape
+    canvas_h = H + 2 * pad
+    canvas_w = V * W + (V + 1) * pad
+    canvas = np.zeros((canvas_h, canvas_w, C), dtype=np.uint8)
+
+    y = pad
+    for i in range(V):
+        x = pad + i * (W + pad)
+        canvas[y:y + H, x:x + W, :] = imgs_np[i]
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    PilImage.fromarray(canvas).save(out_path)
+    print("Saved training views grid to", out_path)
+
+def make_gt_of_sample_list(samples, elev_deg=15.0, debug_dir: str = "debug/test"):
+    Path(debug_dir).mkdir(parents=True, exist_ok=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    V = 4
+    renderer = MeshRendererMVDream(device=device, image_size=256)
+    # get camera once
+    cam_gpu = get_camera(
+        num_frames=V,
+        elevation=elev_deg,
+        azimuth_start=0.0,
+        azimuth_span=360.0,
+        blender_coord=False,
+    ).to(device, non_blocking=True)
+    cam = cam_gpu.contiguous()
+
+    pbar = tqdm(total=len(samples), desc="Rendering GT meshes", unit="samples")
+    for sample in samples:
+        name = get_point_cloud_name_reg(sample, with_number=True)
+
+        mesh_path = get_mesh_from_pc(sample)
+
+        mesh = load_objs_as_meshes([mesh_path], device=device, load_textures=False)
+        verts_m = mesh.verts_packed().to(device)
+        faces_m = mesh.faces_packed().to(device)
+
+        target_imgs = renderer.render_mvdream_views(verts_m, faces_m, camera=cam).contiguous()
+
+        save_training_views_grid(
+            imgs=target_imgs,
+            out_path=os.path.join(debug_dir, f"{name}_target.png"),
+        )
+        pbar.update(1)
 class LoRATrainer:
     def __init__(self, device, lora_rank, lora_alpha, num_steps=200, model_name="sd-v2.1-base-4view", H=256, W=256, ELEV_DEG=15.0, DIST=2.5, num_views=4, load_from_ckpth : bool =False, ckpt_path="checkpoints/mvdream_lora_pc_shoes_interleaved.pt"):
         self.num_steps = num_steps
@@ -107,7 +161,7 @@ class LoRATrainer:
         
         # Define projector properly
         dummy_c = self.model.get_learned_conditioning(["dummy"]).to(self.device)
-        self.dummy_pointcloud_path = "/home/bweiss/Benedikt/ShapeDream/data/dataset_masked/bag1.ply"
+        self.dummy_pointcloud_path = f"f{working_dir}/../../data/dataset_masked/bag1.ply"
 
         self.pointnet = YanxPointNet2Encoder(
         normal_channel=False,
@@ -173,7 +227,7 @@ class LoRATrainer:
         
         return renderer, verts
 
-    def get_renderings_verts_from_file_mesh(self, mesh_path=None):
+    def get_renderings_verts_from_file_mesh(self, mesh_path=None, textures=False):
         """
         mesh_path: Path to a .ply or .obj file containing mesh data
         """
@@ -183,7 +237,7 @@ class LoRATrainer:
             verts, faces = load_ply(mesh_path)
         else:
             # For .obj files, load_objs_as_meshes is often more robust
-            mesh = load_objs_as_meshes([mesh_path], device=self.device, load_textures=False)
+            mesh = load_objs_as_meshes([mesh_path], device=self.device, load_textures=textures)
             verts = mesh.verts_packed()
             faces = mesh.faces_packed()
 
@@ -220,7 +274,7 @@ class LoRATrainer:
                 z_cond = self.model.get_first_stage_encoding(z_cond)
 
         if save_train_img:
-            self.save_training_views_grid(imgs=condition_imgs, out_path="debug/" + debug_name + "_check_pc" + ".png")
+            save_training_views_grid(imgs=condition_imgs, out_path="debug/" + debug_name + "_check_pc" + ".png")
 
 
         mesh_path = get_mesh_from_pc(debug_name + ".ply")
@@ -230,7 +284,7 @@ class LoRATrainer:
         target_imgs = self.renderer.render_mvdream_views(verts_m, faces_m, camera=camera)
 
         if save_train_img:
-            self.save_training_views_grid(imgs=target_imgs, out_path="debug/" + debug_name + "_target" + ".png")
+            save_training_views_grid(imgs=target_imgs, out_path="debug/" + debug_name + "_target" + ".png")
 
         with torch.no_grad():
             z = self.model.encode_first_stage(target_imgs)
@@ -301,27 +355,6 @@ class LoRATrainer:
         torch.save({"unet": self.unet.state_dict(), "projector": self.projector.state_dict()}, ckpt_path)
         print("Saved", ckpt_path)
 
-    def save_training_views_grid(self, imgs, out_path, pad=16):
-        """
-        imgs: (V,3,H,W) in [-1,1]
-        """
-        imgs_np = (0.5 * (imgs + 1.0)).clamp(0,1) 
-        imgs_np = (imgs_np.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
-
-        V, H, W, C = imgs_np.shape
-        canvas_h = H + 2 * pad
-        canvas_w = V * W + (V + 1) * pad
-        canvas = np.zeros((canvas_h, canvas_w, C), dtype=np.uint8)
-
-        y = pad
-        for i in range(V):
-            x = pad + i * (W + pad)
-            canvas[y:y + H, x:x + W, :] = imgs_np[i]
-
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        PilImage.fromarray(canvas).save(out_path)
-        print("Saved training views grid to", out_path)
-    
     @torch.no_grad()
     def build_cache(
         self,
@@ -342,36 +375,28 @@ class LoRATrainer:
                 - "z": (V,4,h,w) float tensor (on CPU)
                 - "camera": (V,4,4) float tensor (on CPU)
         """
-        import os
-        from pathlib import Path
-
         Path(debug_dir).mkdir(parents=True, exist_ok=True)
 
         device = self.device
-        is_cuda = (hasattr(device, "type") and device.type == "cuda") or (str(device).startswith("cuda"))
         V = int(self.num_views)
 
-        # --- Camera (compute once if fixed) ---
-        if use_fixed_camera:
-            cam_gpu = get_camera(
-                num_frames=V,
-                elevation=self.ELEV_DEG,
-                azimuth_start=0.0,
-                azimuth_span=360.0,
-                blender_coord=False,
-            ).to(device, non_blocking=True)
-            cam_gpu = cam_gpu.contiguous()
-            cam_cpu_shared = cam_gpu.detach().to("cpu", non_blocking=False).contiguous()
-        else:
-            cam_gpu = None
-            cam_cpu_shared = None
+        # get camera once
+        cam_gpu = get_camera(
+            num_frames=V,
+            elevation=self.ELEV_DEG,
+            azimuth_start=0.0,
+            azimuth_span=360.0,
+            blender_coord=False,
+        ).to(device, non_blocking=True)
+        cam = cam_gpu.contiguous()
+        cam_cpu = cam_gpu.detach().to("cpu", non_blocking=False).contiguous()
+
 
         # Put model(s) into eval once.
         self.model.eval()
         if hasattr(self, "pointnet") and self.pointnet is not None:
             self.pointnet.eval()
 
-        # Optional: small cache for prompt encodings (keyed by prompt string)
         text_cond_cache = {}
 
         cache = {}
@@ -386,19 +411,6 @@ class LoRATrainer:
                 pc_feat = pc_feat.unsqueeze(0)
             pc_feat = pc_feat.detach().contiguous()
 
-            # --- Camera per sample if not fixed ---
-            if cam_gpu is None:
-                cam = get_camera(
-                    num_frames=V,
-                    elevation=self.ELEV_DEG,
-                    azimuth_start=0.0,
-                    azimuth_span=360.0,
-                    blender_coord=False,
-                ).to(device, non_blocking=True).contiguous()
-                cam_cpu = cam.detach().to("cpu", non_blocking=False).contiguous()
-            else:
-                cam = cam_gpu
-                cam_cpu = cam_cpu_shared  # shared reference; no duplication
 
             # --- Render target multi-view images ---
             mesh_path = get_mesh_from_pc(sample)
@@ -406,7 +418,7 @@ class LoRATrainer:
             target_imgs = self.renderer.render_mvdream_views(verts_m, faces_m, camera=cam).contiguous()
 
             if save_debug_imgs:
-                self.save_training_views_grid(
+                save_training_views_grid(
                     imgs=target_imgs,
                     out_path=os.path.join(debug_dir, f"{name}_target.png"),
                 )
@@ -422,7 +434,7 @@ class LoRATrainer:
             if save_debug_imgs:
                 pc_renderer, verts_pc = self.get_renderings_verts_from_file_pc(pc_path)
                 cond_imgs = pc_renderer.render_mvdream_views(verts_pc, camera=cam)
-                self.save_training_views_grid(
+                save_training_views_grid(
                     imgs=cond_imgs,
                     out_path=os.path.join(debug_dir, f"{name}_pc.png"),
                 )

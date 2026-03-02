@@ -13,7 +13,6 @@ from test_pointnet_encoder import get_pointnet_features, PointFeatProjector, get
 
 from pathlib import Path
 from rembg import new_session, remove
-from depth_map_encoder import DepthViTTokenEncoder
 from yanx_pointnet2_encoder import YanxPointNet2Encoder
 
 working_dir = str(Path(__file__).parent.parent.parent.absolute())
@@ -109,7 +108,7 @@ class Tester3D:
         num_views: int = 4,
         H: int = 256,
         W: int = 256,
-        steps: int = 50,
+        steps: int = 100,
         scale: float = 7.5,
         seed: int = 42,
     ):
@@ -137,7 +136,7 @@ class Tester3D:
             elevation=self.ELEV_DEG,
             azimuth_start=self.AZIM_START,
             azimuth_span=self.AZIM_SPAN,
-            blender_coord=True,
+            blender_coord=False,
         ).to(self.device)
 
         if use_pointcloud:
