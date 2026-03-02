@@ -9,9 +9,11 @@ import point_cloud_utils as pcu
 from plyfile import PlyData, PlyElement
 from yanx_pointnet2_encoder import YanxPointNet2Encoder
 import re
+from view_renderer import normalize_vertices
 
-test_file = "../data/dataset/bag1.ply"
-data_directory = "../data/dataset"
+working_dir = os.path.dirname(os.path.abspath(__file__))
+test_file = f"{working_dir}/../../data/dataset/bag1.ply"
+data_directory = f"{working_dir}/../../data/dataset"
 
 def get_point_cloud_name(file):
     # get name from file name such that we can input it into model properly
@@ -24,9 +26,12 @@ def get_point_cloud_name(file):
             result += a
     return result
 
-def get_point_cloud_reg(file):
+def get_point_cloud_name_reg(file, with_number=False):
     file = os.path.basename(file)
-    result = re.findall(rf"[A-Za-z]+\d+", file)[0]
+    if with_number:
+        result = re.findall(rf"[A-Za-z ]+\d+", file)[0]
+    else:
+        result = re.findall(rf"[A-Za-z ]+\d", file)[0][:-1]
     return result
 
 def read_from_data_folder(directory):
@@ -51,33 +56,30 @@ def read_from_data_folder(directory):
 
 def read_from_plyfile(file):
 
-    mesh = trimesh.load_scene(file, "ply")
-    mesh = mesh.to_geometry()
+    points = pcu.load_mesh_v(file)
 
-    return mesh
+    return points
 
 
-def pointNet(pointcloud_path, device):
-    print("pointnet device: ", device)
-    pointnet = YanxPointNet2Encoder(
-        #ckpt_path="/home/bweiss/Benedikt/ShapeDream/models/Pointnet_Pointnet2_pytorch/log/classification/pointnet2_ssg_wo_normals/checkpoints/best_model.pth",
-        #models_root="/home/bweiss/Benedikt/ShapeDream/models/Pointnet_Pointnet2_pytorch",
-        normal_channel=False,
-        out_dim=256,
-        device=device,
-    )
+def get_pointnet_features(pointnet, pointcloud_path, device):
+
 
     points = read_from_plyfile(pointcloud_path)
-    verts = torch.tensor(points.vertices, dtype=torch.float32)
+    verts = torch.tensor(points, dtype=torch.float32, device=device)
 
     # keep XYZ only
+    '''
     verts = verts[:, :3]
-
     # center and scale to unit sphere (common for PointNet)
     verts = verts - verts.mean(0, keepdim=True)
     scale = verts.norm(dim=1).max()
     if scale > 0:
         verts = verts / scale
+    '''
+
+    # Returns (1,N,3)
+    verts = normalize_vertices(verts)
+    verts = verts.squeeze(0)
 
     # sample a fixed number of points
     num_points = 2048
@@ -119,6 +121,8 @@ class PointFeatProjector(nn.Module):
         feat: [B, in_dim]   (here B=1)
         return: [B, num_tokens, context_dim]
         """
+        if feat.ndim == 3:
+            feat = feat.squeeze(1)
         B, _ = feat.shape
         out = self.mlp(feat)  # [B, num_tokens * context_dim]
         return out.view(B, self.num_tokens, self.context_dim)
@@ -131,8 +135,8 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     encoder = YanxPointNet2Encoder(
-        ckpt_path="/home/bweiss/Benedikt/ShapeDream/models/Pointnet_Pointnet2_pytorch/log/classification/pointnet2_ssg_wo_normals/checkpoints/best_model.pth",
-        models_root="/home/bweiss/Benedikt/ShapeDream/models/Pointnet_Pointnet2_pytorch/models",
+        ckpt_path=f"{working_dir}/../../models_pointnet/Pointnet_Pointnet2_pytorch/log/classification/pointnet2_ssg_wo_normals/checkpoints/best_model.pth",
+        models_root=f"{working_dir}/../../models_pointnet/Pointnet_Pointnet2_pytorch/models",
         normal_channel=False,
         out_dim=256,
         device=device,

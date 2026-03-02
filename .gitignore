@@ -155,5 +155,7 @@ dmypy.json
 *.onnx
 
 # current files
-debug/ 
+debug/
+debug2/
 debug_3D/
+*.png

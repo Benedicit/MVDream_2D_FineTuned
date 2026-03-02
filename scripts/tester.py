@@ -5,55 +5,71 @@ import numpy as np
 from PIL import Image, ImageFilter, ImageOps
 
 from mvdream.model_zoo import build_model
-from mvdream.camera_utils import get_camera
+from mvdream.camera_utils import get_camera, create_camera_to_world_matrix
 from mvdream.ldm.models.diffusion.ddim import DDIMSampler
 
 from lora import add_lora_to_mvdream_unet, LoRALinear
-from test_pointnet_encoder import pointNet, PointFeatProjector, get_point_cloud_name
+from test_pointnet_encoder import get_pointnet_features, PointFeatProjector, get_point_cloud_name, read_from_plyfile
 
 from pathlib import Path
 from rembg import new_session, remove
+from yanx_pointnet2_encoder import YanxPointNet2Encoder
 
-working_dir = os.path.dirname(os.path.realpath(__file__))
+working_dir = str(Path(__file__).parent.parent.parent.absolute())
 print(working_dir)
-SNAP_DIR = f"{working_dir}/../../snap_gtr"
-OUTPUT_DIR = working_dir + "/../debug"
-MESH_DIR = working_dir + "/../debug_3D"
+SNAP_DIR = f"{working_dir}/snap_gtr"
+OUTPUT_DIR = working_dir + "/mvdream_2D/debug"
+MESH_DIR = working_dir + "/mvdream_2D/debug_3D"
+SHAPEDREAM_DIR = f"{working_dir}"
 print(SNAP_DIR)
-sys.path.insert(1, SNAP_DIR+"/..")
+sys.path.insert(0, SHAPEDREAM_DIR)
+if SNAP_DIR not in sys.path:
+    sys.path.insert(0, str(SNAP_DIR))
+
 from snap_gtr.scripts import inference, prepare_mv
 
-
+from view_renderer import PointRenderer, MeshRendererMVDream
 import math
 import numpy as np
 from pathlib import Path
-
+from transformers import AutoModelForImageSegmentation
 
 class Tester3D:
-    def __init__(self, ckpt_path = "checkpoints/mvdream_lora_pc_bag1_multiview.pt", ELEV_DEG=15.0, AZIM_START=0.0, AZIM_SPAN=360.0):
+    def __init__(self, ckpt_path = "checkpoints/mvdream_lora_pc_shoes_multiview.pt", ELEV_DEG=15.0, AZIM_START=0.0, AZIM_SPAN=360.0):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
         self.ckpt_path = ckpt_path
         self.ELEV_DEG = ELEV_DEG
         self.AZIM_START = AZIM_START
         self.AZIM_SPAN = AZIM_SPAN
-        self.rembg_session = new_session("u2net")  
+        self.rembg_session = new_session("u2net")
 
-    def load_model_for_pc(self, pointcloud_path, model="sd-v2.1-base-4view"):
+        self.pointnet = YanxPointNet2Encoder(
+            normal_channel=False,
+            out_dim=256,
+            device=self.device,
+        )
+        self.birefnet = AutoModelForImageSegmentation.from_pretrained('ZhengPeng7/BiRefNet', trust_remote_code=True).to(self.device)
+        self.birefnet.eval()
+        #self.birefnet.half()
+    def load_model_for_pc(self, pointcloud_path, model="sd-v2.1-base-4view", lora_rank=8):
         
         self.model = build_model(model)
         self.model.to(self.device)
         self.model.device = self.device
         self.unet = self.model.model.diffusion_model
-        add_lora_to_mvdream_unet(self.unet, r=32, alpha=8.0)
+        add_lora_to_mvdream_unet(self.unet, r=lora_rank, alpha=8.0)
 
         dummy_c = self.model.get_learned_conditioning(["dummy"]).to(self.device)
         context_dim = dummy_c.shape[-1]
 
+
         with torch.no_grad():
-            pc_feat_dummy = pointNet(pointcloud_path=pointcloud_path, device=self.device)
+            pc_feat_dummy = get_pointnet_features(self.pointnet, pointcloud_path=pointcloud_path, device=self.device)
         pc_feat_dim = pc_feat_dummy.shape[-1]
 
+        #self.depth_map_encoder = DepthViTTokenEncoder(token_dim=context_dim, tokens_per_view=1, num_views=4).to(
+            #self.device)
         projector = PointFeatProjector(
         in_dim=pc_feat_dim,
         context_dim=context_dim,
@@ -65,17 +81,34 @@ class Tester3D:
         self.unet.load_state_dict(ckpt["unet"], strict=False)
         self.projector.load_state_dict(ckpt["projector"], strict=True)
 
-    
+        #self.model = torch.compile(self.model, mode="reduce-overhead")
+        #self.projector = torch.compile(self.projector)
+        #self.unet = torch.compile(self.unet, mode="reduce-overhead")
+
+        #self.depth_map_encoder.load_state_dict(ckpt["depth_map_encoder"], strict=False)
+
+    def get_renderings_verts_from_file_pc(self, pointcloud_path=None):
+        """
+        pointcloud_path: Path to pointcloud
+        """
+        # Get full pointcloud to train against
+        points_obj = read_from_plyfile(pointcloud_path)
+        verts = torch.tensor(points_obj.vertices, dtype=torch.float32, device=self.device)[:, :3]
+
+        renderer = PointRenderer(device=self.device, image_size=256, radius=0.015)
+
+        return renderer, verts
+
     @torch.no_grad()
     def sample_multiview(
         self, 
         pointcloud_path: str,
-        prompt: str = "a bag",
+        prompt: str = "a shoe",
         use_pointcloud: bool = True,
         num_views: int = 4,
         H: int = 256,
         W: int = 256,
-        steps: int = 50,
+        steps: int = 100,
         scale: float = 7.5,
         seed: int = 42,
     ):
@@ -94,7 +127,6 @@ class Tester3D:
         latent_shape = [4, H // 8, W // 8]
         batch_size = num_views
 
-
         c_text = self.model.get_learned_conditioning([prompt] * num_views).to(self.device)   # [V,L,C]
         uc_text = self.model.get_learned_conditioning([""] * num_views).to(self.device)     # [V,L,C]
 
@@ -104,14 +136,15 @@ class Tester3D:
             elevation=self.ELEV_DEG,
             azimuth_start=self.AZIM_START,
             azimuth_span=self.AZIM_SPAN,
-            blender_coord=True,
+            blender_coord=False,
         ).to(self.device)
 
         if use_pointcloud:
-            pc_feat = pointNet(pointcloud_path=pointcloud_path, device=self.device)     
+            pc_feat = get_pointnet_features(self.pointnet, pointcloud_path=pointcloud_path, device=self.device)
+
+            print(f"pc_feat mean/std={pc_feat.mean().item():.4f}/{pc_feat.std().item():.4f}")
             pc_feats_views = pc_feat.expand(num_views, -1)                         # [V,D_pc]
             pc_tokens = self.projector(pc_feats_views)                                  # [V,K,C]
-
             cond_context = torch.cat([c_text, pc_tokens], dim=1)                   # [V,L+K,C]
 
 
@@ -132,22 +165,21 @@ class Tester3D:
             "camera": self.camera,
             "num_frames": num_views,
         }
-
-        samples, _ = sampler.sample(
-            S=steps,
-            conditioning=cond,
-            batch_size=batch_size,
-            shape=latent_shape,
-            verbose=False,
-            unconditional_guidance_scale=scale,
-            unconditional_conditioning=uc,
-            eta=0.0,
-            x_T=None,
-        )
-
-        x = self.model.decode_first_stage(samples)                
-        x = torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)           
-        x = (x * 255.0).permute(0, 2, 3, 1).cpu().numpy()    
+        with torch.amp.autocast("cuda"):
+            samples, _ = sampler.sample(
+                S=steps,
+                conditioning=cond,
+                batch_size=batch_size,
+                shape=latent_shape,
+                verbose=False,
+                unconditional_guidance_scale=scale,
+                unconditional_conditioning=uc,
+                eta=0.0,
+                x_T=None,
+            )
+        x = self.model.decode_first_stage(samples)
+        x = torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
+        x = (x * 255.0).permute(0, 2, 3, 1).cpu().numpy()
 
         return x.astype(np.uint8)
 
@@ -215,6 +247,40 @@ class Tester3D:
         a = (dist > thresh).astype(np.uint8) * 255
         return a
 
+    @torch.no_grad()
+    def remove_bg_with_birefnet(self, rgb_u8: np.ndarray) -> np.ndarray:
+        # BiRefNet works best on 1024x1024 inputs
+        H, W, _ = rgb_u8.shape
+        img_input = Image.fromarray(rgb_u8)
+        img_resized = img_input.resize((1024, 1024), Image.BILINEAR)
+
+        img_tensor = torch.from_numpy(np.array(img_resized)).permute(2, 0, 1).float() / 255.0
+        img_tensor = img_tensor.unsqueeze(0).to(self.device)
+
+        mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
+        img_tensor = (img_tensor - mean) / std
+
+        pred = self.birefnet(img_tensor)
+        if isinstance(pred, (list, tuple)):
+            pred = pred[0]
+
+        # BiRefNet returns logits, use sigmoid to get mask
+        pred = torch.sigmoid(pred)
+        mask = pred[0, 0].cpu().numpy()
+
+        # Resize mask back to original size
+        mask_img = Image.fromarray((mask * 255).astype(np.uint8)).resize((W, H), Image.BILINEAR)
+        alpha_u8 = np.array(mask_img)
+
+        # Refine mask: anything very low becomes 0, anything very high becomes 255
+        # This helps preventing the "semi-transparent" look that deletes object parts
+        alpha_u8[alpha_u8 < 15] = 0
+        alpha_u8[alpha_u8 > 240] = 255
+
+        rgba = np.dstack([rgb_u8, alpha_u8]).astype(np.uint8)
+        return rgba
+
     def save_4_views(self, images_np, out_dir: str, dist=2.5, fov_deg=50.0):
         out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
         V, H, W, C = images_np.shape
@@ -222,7 +288,8 @@ class Tester3D:
 
         for i in range(V):
             rgb = images_np[i].astype(np.uint8)
-
+            
+            '''
             # 1) make alpha from corner background (no rembg)
             a = self.alpha_from_corner_key(rgb, pad=16, thresh=0.10)
 
@@ -233,24 +300,27 @@ class Tester3D:
 
             # 3) write RGBA (SnapGTR won’t crash)
             rgba = np.concatenate([rgb, a[..., None]], axis=-1).astype(np.uint8)
+            '''
+
+            rgba = self.remove_bg_with_birefnet(rgb)
             Image.fromarray(rgba, "RGBA").save(out_dir / f"rgb_{i:03d}.png")
 
             # debug: save alpha to inspect
-            Image.fromarray(a, "L").save(out_dir / f"_alpha_{i:03d}.png")
+            #Image.fromarray(a, "L").save(out_dir / f"_alpha_{i:03d}.png")
 
+            """
             cam = self.camera.detach().cpu().numpy().reshape(V,4,4)
             C_bl = cam[:, :3, 3]
             C_cv = np.stack([C_bl[:, 0], C_bl[:, 2], -C_bl[:, 1]], axis=1)
 
             phi_world = np.degrees(np.arctan2(C_cv[:, 2], C_cv[:, 0]))
             azims_deg = (90.0 - phi_world) % 360.0
-
+            """
         self.write_snapgtr_cameras_from_angles(
             out_dir=str(out_dir),
             fov_deg=fov_deg,
             H=H, W=W,
             elev_deg=self.ELEV_DEG,
-            azims_deg=azims_deg.tolist(),
             radius=dist,
         )
 
@@ -288,24 +358,25 @@ class Tester3D:
         return c2w
 
     def write_snapgtr_cameras_from_angles(self, out_dir: str, fov_deg: float, H: int, W: int,
-                                        elev_deg: float, azims_deg, radius: float):
+                                          elev_deg: float, radius: float,
+                                          azims_deg=[0.0,90.0,180.0,270.0]):
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         K = self._fov_to_intrinsic(fov_deg, W, H)
-        center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
-        # SnapGTR reference mapping:
-        # theta_list = 90 - elevation
-        # phi_list   = 90 - azimuth
-        theta = 90.0 - float(elev_deg)
+        for i in range(len(azims_deg)):
+            az = azims_deg[i]
+            c2w = create_camera_to_world_matrix(elev_deg, az)
 
-        for i, az in enumerate(azims_deg):
-            phi = 90.0 - float(az)
+            # Scale translation by radius
+            c2w[:3, 3] *= radius
+            eye = c2w[:3, 3]
 
-            eye = self._get_cam_pose(theta, phi, radius)
-            c2w = self._get_c2w_opencv(eye, center)
-            w2c = np.linalg.inv(c2w)
+            c2w_cv = self._get_c2w_opencv(eye, np.array([0,0,0]))
+
+            # Get w2c for SnapGTR
+            w2c = np.linalg.inv(c2w_cv)
 
             p = out_dir / f"cam_{i:03d}.txt"
             with p.open("w") as f:
@@ -315,5 +386,4 @@ class Tester3D:
                 f.write("\n")
                 f.write("intrinsic fx, fy, cx, cy, height, width \n")
                 f.write(f"{K[0,0]:.6f} {K[1,1]:.6f} {K[0,2]:.6f} {K[1,2]:.6f} {H} {W}\n")
-
 

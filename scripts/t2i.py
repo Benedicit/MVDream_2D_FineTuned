@@ -5,14 +5,12 @@ import argparse
 from PIL import Image
 import numpy as np
 from omegaconf import OmegaConf
-import torch 
+import torch
 
 from mvdream.camera_utils import get_camera
 from mvdream.ldm.util import instantiate_from_config
 from mvdream.ldm.models.diffusion.ddim import DDIMSampler
 from mvdream.model_zoo import build_model
-
-from test_pointnet_encoder import read_from_plyfile, pointNet, PointFeatProjector
 
 def set_seed(seed):
     random.seed(seed)
@@ -21,46 +19,24 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def t2i(model, image_size, prompt, uc, sampler, step=20, scale=7.5, batch_size=8, ddim_eta=0., dtype=torch.float32, device="cuda", camera=None, num_frames=1, pc_feat=None,
-    projector: PointFeatProjector = None):
+def t2i(model, image_size, prompt, uc, sampler, step=20, scale=7.5, batch_size=8, ddim_eta=0., dtype=torch.float32, device="cuda", camera=None, num_frames=1):
     if type(prompt)!=list:
         prompt = [prompt]
     with torch.no_grad(), torch.autocast(device_type=device, dtype=dtype):
         c = model.get_learned_conditioning(prompt).to(device)
-
-        if projector is not None and pc_feat is not None:
-            if pc_feat.ndim == 1:
-                pc_feat_ = pc_feat.unsqueeze(0)
-            else:
-                pc_feat_ = pc_feat
-
-            pc_tokens = projector(pc_feat_)  
-            pc_tokens = pc_tokens * 7
-
-            #c_context = pc_tokens 
-            c_context = torch.cat([c, pc_tokens], dim=1)  
-           
-            zeros_pc = torch.zeros_like(pc_tokens)
-            #uc_context =  torch.zeros_like(pc_tokens) 
-            uc_context = torch.cat([uc, zeros_pc], dim=1)
-        else:
-            c_context = c
-            uc_context = uc
-
-
-        c_ = {"context": c_context.repeat(batch_size,1,1)}
-        uc_ = {"context": uc_context.repeat(batch_size,1,1)}
+        c_ = {"context": c.repeat(batch_size,1,1)}
+        uc_ = {"context": uc.repeat(batch_size,1,1)}
         if camera is not None:
             c_["camera"] = uc_["camera"] = camera
             c_["num_frames"] = uc_["num_frames"] = num_frames
 
         shape = [4, image_size // 8, image_size // 8]
         samples_ddim, _ = sampler.sample(S=step, conditioning=c_,
-                                        batch_size=batch_size, shape=shape,
-                                        verbose=False, 
-                                        unconditional_guidance_scale=scale,
-                                        unconditional_conditioning=uc_,
-                                        eta=ddim_eta, x_T=None)
+                                         batch_size=batch_size, shape=shape,
+                                         verbose=False,
+                                         unconditional_guidance_scale=scale,
+                                         unconditional_conditioning=uc_,
+                                         eta=ddim_eta, x_T=None)
         x_sample = model.decode_first_stage(samples_ddim)
         x_sample = torch.clamp((x_sample + 1.0) / 2.0, min=0.0, max=1.0)
         x_sample = 255. * x_sample.permute(0,2,3,1).cpu().numpy()
@@ -91,8 +67,6 @@ if __name__ == "__main__":
     device = args.device
     batch_size = max(4, args.num_frames)
 
-   
-
     print("load t2i model ... ")
     if args.config_path is None:
         model = build_model(args.model_name, ckpt_path=args.ckpt_path)
@@ -105,39 +79,24 @@ if __name__ == "__main__":
     model.to(device)
     model.eval()
 
-     # Get the pointcloud features properly
-    pointcloud_path = "/home/temp_compute/Benedikt/ShapeDream/data/dataset/bag1.ply"
-    pc_feat = pointNet(pointcloud_path=pointcloud_path, device=args.device)
-
-
-    tmp_c = model.get_learned_conditioning(["dummy"]).to(device) 
-    context_dim = tmp_c.shape[-1]
-
-    projector = PointFeatProjector(
-        in_dim=pc_feat.shape[-1],
-        context_dim=context_dim,
-        num_tokens=70,
-    ).to(args.device)
-    projector.eval()
-
     sampler = DDIMSampler(model)
     uc = model.get_learned_conditioning( [""] ).to(device)
     print("load t2i model done . ")
 
     # pre-compute camera matrices
     if args.use_camera:
-        camera = get_camera(args.num_frames, elevation=args.camera_elev, 
-                azimuth_start=args.camera_azim, azimuth_span=args.camera_azim_span)
+        camera = get_camera(args.num_frames, elevation=args.camera_elev,
+                            azimuth_start=args.camera_azim, azimuth_span=args.camera_azim_span)
         camera = camera.repeat(batch_size//args.num_frames,1).to(device)
     else:
         camera = None
-    
+
     t = args.text + args.suffix
     set_seed(args.seed)
     images = []
     for j in range(3):
-        img = t2i(model, args.size, t, uc, sampler, step=50, scale=10, batch_size=batch_size, ddim_eta=0.0, 
-                dtype=dtype, device=device, camera=camera, num_frames=args.num_frames, pc_feat=pc_feat, projector=projector)
+        img = t2i(model, args.size, t, uc, sampler, step=50, scale=10, batch_size=batch_size, ddim_eta=0.0,
+                  dtype=dtype, device=device, camera=camera, num_frames=args.num_frames)
         img = np.concatenate(img, 1)
         images.append(img)
     images = np.concatenate(images, 0)
