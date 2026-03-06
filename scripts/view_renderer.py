@@ -225,8 +225,8 @@ class MeshRendererMVDream(MVDreamRenderer):
             else:
                 # Fallback to linear
                 v_combined = (verts_n + 1.0) * 0.5
-            low_bound = 35.0 / 255.0
-            high_bound = 160.0 / 255.0
+            low_bound = 25.0 / 255.0
+            high_bound = 145.0 / 255.0
 
             verts_rgb = low_bound + (high_bound - low_bound) * v_combined
 

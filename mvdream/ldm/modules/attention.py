@@ -31,7 +31,8 @@ def uniq(arr):
 def default(val, d):
     if exists(val):
         return val
-    return d() if isfunction(d) else d
+    #return d() if isfunction(d) else d
+    return d() if callable(d) else d
 
 
 def max_neg_value(t):
@@ -168,16 +169,21 @@ class CrossAttention(nn.Module):
         k = self.to_k(context)
         v = self.to_v(context)
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+        #q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
+        q = rearrange(q, 'b n (h d) -> b h n d', h=h)
+        k = rearrange(k, 'b n (h d) -> b h n d', h=h)
+        v = rearrange(v, 'b n (h d) -> b h n d', h=h)
         # force cast to fp32 to avoid overflowing
-        if _ATTN_PRECISION =="fp32":
-            with torch.autocast(enabled=False, device_type = 'cuda'):
-                q, k = q.float(), k.float()
-                sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-        else:
-            sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-        
+        # if _ATTN_PRECISION =="fp32":
+        #     with torch.autocast(enabled=False, device_type = 'cuda'):
+        #         q, k = q.float(), k.float()
+        #         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        # else:
+        #     sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        #
+
+        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
         del q, k
     
         if exists(mask):
@@ -232,8 +238,8 @@ class MemoryEfficientCrossAttention(nn.Module):
         # actually compute the attention, what we cannot get enough of
         out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=self.attention_op)
 
-        if exists(mask):
-            raise NotImplementedError
+        #if exists(mask):
+        #    raise NotImplementedError
         out = (
             out.unsqueeze(0)
             .reshape(b, self.heads, out.shape[1], self.dim_head)
