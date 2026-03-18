@@ -48,13 +48,13 @@ def train_all_interleaved():
     base_path_masked = f"{working_dir}/../../data/dataset_masked/"
     train_samples = []
     
-    num_samples = 320
+    num_samples = 720
     class_names = [#"airplane",
                    #"bag",
                    #"basket",
                    #"bathtub",
                    #"bed",
-                   #"bench",
+                   "bench",
                    #"birdhouse",
                    #"bookshelf",
                    #"bottle",
@@ -64,7 +64,7 @@ def train_all_interleaved():
                    #"camera",
                    #"can",
                    #"cap",
-                   #"car",
+                   "car",
                    #"cellphone",
                    "chair",
                    #"clock",
@@ -97,7 +97,7 @@ def train_all_interleaved():
                    #"skateboard",
                    #"sofa",
                    #"stove",
-                   #"table",
+                   "table",
                    #"telephone",
                    #"tower",
                    #"train",
@@ -131,6 +131,8 @@ def train_all_interleaved():
         load_from_ckpth=False,
         #ckpt_path="checkpoints/mvdream_lora_pc_128_classes_chair_interleaved.pt"
     )
+    trainer.save_weights(f"checkpoints/mvdream_lora_pc_{num_samples}_classes_{class_names[0]}_raw.pt")
+    return
 
 
     train_cache = trainer.build_cache(
@@ -192,7 +194,7 @@ def train_all_interleaved():
             pbar.set_description(f"step={global_step} sample={sample} train_loss={loss:.6f}")
             pbar.update(1)
             global_step += 1
-    trainer.save_weights(f"checkpoints/mvdream_lora_pc_{num_samples}_classes_{class_names[0]}.pt")
+    trainer.save_weights(f"checkpoints/mvdream_lora_pc_{num_samples}_classes_{class_names[0]}_no_pc.pt")
 
 
 

@@ -52,7 +52,7 @@ class Tester3D:
         self.birefnet = AutoModelForImageSegmentation.from_pretrained('ZhengPeng7/BiRefNet', trust_remote_code=True).to(self.device)
         self.birefnet.eval()
         #self.birefnet.half()
-    def load_model_for_pc(self, pointcloud_path, model="sd-v2.1-base-4view", lora_rank=8):
+    def load_model_for_pc(self, pointcloud_path, model="sd-v2.1-base-4view", lora_rank=32):
         
         self.model = build_model(model)
         self.model.to(self.device)
@@ -103,7 +103,7 @@ class Tester3D:
     def sample_multiview(
         self, 
         pointcloud_path: str,
-        prompt: str = "a shoe",
+        prompt: str = "an object",
         use_pointcloud: bool = True,
         num_views: int = 4,
         H: int = 256,
@@ -146,10 +146,12 @@ class Tester3D:
             pc_feats_views = pc_feat.expand(num_views, -1)                         # [V,D_pc]
             pc_tokens = self.projector(pc_feats_views)                                  # [V,K,C]
             cond_context = torch.cat([c_text, pc_tokens], dim=1)                   # [V,L+K,C]
+            #cond_context = torch.cat([pc_tokens], dim=1)                   # [V,L+K,C]
 
 
             uc_pc_tokens = torch.zeros_like(pc_tokens)
             uc_context = torch.cat([uc_text, uc_pc_tokens], dim=1)                    # [V,L+K,C]
+            #uc_context = torch.cat([uc_pc_tokens], dim=1)                    # [V,L+K,C]
         else:
             cond_context = c_text                                                  # [V,L,C]
             uc_context = uc_text                                                   # [V,L,C]
@@ -201,10 +203,10 @@ class Tester3D:
         Image.fromarray(canvas).save(out_path)
         print("Saved", out_path)
 
-    def views_to_3D(self, object_name):
+    def views_to_3D(self, object_path):
         #output_dir = OUTPUT_DIR + "/" + object_name
-        out_dir = Path(MESH_DIR) / object_name
-        in_dir  = Path(OUTPUT_DIR) / object_name
+        out_dir = Path(object_path)
+        in_dir  = Path(object_path)
         inference.main(
             args=[
                 "--ckpt_path", str(Path(SNAP_DIR) / "ckpts/full_checkpoint.pth"),
@@ -289,33 +291,10 @@ class Tester3D:
         for i in range(V):
             rgb = images_np[i].astype(np.uint8)
             
-            '''
-            # 1) make alpha from corner background (no rembg)
-            a = self.alpha_from_corner_key(rgb, pad=16, thresh=0.10)
-
-            # 2) kill tiny speckles + soften edge a bit (optional but helpful)
-            a_img = Image.fromarray(a, "L").filter(ImageFilter.MinFilter(3))   # erode a little
-            a_img = a_img.filter(ImageFilter.GaussianBlur(1.0))               # soft edge
-            a = np.array(a_img, dtype=np.uint8)
-
-            # 3) write RGBA (SnapGTR won’t crash)
-            rgba = np.concatenate([rgb, a[..., None]], axis=-1).astype(np.uint8)
-            '''
-
             rgba = self.remove_bg_with_birefnet(rgb)
             Image.fromarray(rgba, "RGBA").save(out_dir / f"rgb_{i:03d}.png")
 
-            # debug: save alpha to inspect
-            #Image.fromarray(a, "L").save(out_dir / f"_alpha_{i:03d}.png")
 
-            """
-            cam = self.camera.detach().cpu().numpy().reshape(V,4,4)
-            C_bl = cam[:, :3, 3]
-            C_cv = np.stack([C_bl[:, 0], C_bl[:, 2], -C_bl[:, 1]], axis=1)
-
-            phi_world = np.degrees(np.arctan2(C_cv[:, 2], C_cv[:, 0]))
-            azims_deg = (90.0 - phi_world) % 360.0
-            """
         self.write_snapgtr_cameras_from_angles(
             out_dir=str(out_dir),
             fov_deg=fov_deg,

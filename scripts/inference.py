@@ -14,11 +14,12 @@ OUTPUT_DIR = working_dir + "/../debug"
 MESH_DIR = working_dir + "/../debug_3D"
 print(SNAP_DIR)
 
-def test_samples(test_samples):
-    base_path = f"{working_dir}/../../data/dataset_masked/"
-    save_path = f"{working_dir}/debug/"
+base_path = f"{working_dir}/../../data/dataset_masked/"
+save_path = f"{working_dir}/debug/"
+
+
+def test_samples(tester: Tester3D, test_samples):
     # load from specific checkpoint
-    tester = Tester3D(ckpt_path="checkpoints/mvdream_lora_pc_320_classes_chair.pt")
     # first need to load model such that we can sample properly
 
     os.makedirs("samples", exist_ok=True)
@@ -34,19 +35,20 @@ def test_samples(test_samples):
         imgs_pc = tester.sample_multiview(
             pointcloud_path=base_path + sample,
             prompt=f"a {prompt}",
-            use_pointcloud=True,
+            use_pointcloud=False,
             #scale=80.0
         )
-        tester.save_view_grid(imgs_pc,  f"samples/{full_name}_samples.png")
+        #tester.save_view_grid(imgs_pc,  f"samples/{full_name}_samples.png")
 
-        obj_name = save_path + full_name
+        obj_path = save_path + full_name
         #os.makedirs(obj_name, exist_ok=True)
         
-        #tester.save_4_views(imgs_pc, out_dir=obj_name)
+        tester.save_4_views(imgs_pc, out_dir=obj_path)
         
-        #tester.views_to_3D(obj_name)
+        tester.views_to_3D(obj_path)
 
 if __name__ == "__main__":
+    tester = Tester3D(ckpt_path="checkpoints/mvdream_lora_pc_720_classes_bench_raw.pt")
     torch.set_float32_matmul_precision('high')
     '''
     train_samples = [
@@ -70,8 +72,8 @@ if __name__ == "__main__":
     classes = ["bench", "chair", "car", "table"]
     classes = ["chair"]
     for cl in classes:
-        for i in range(4200, 42010):
+        for i in range(4200, 4450):
             train_samples.append(f"shapenet_chair{i}.ply")
             #train_samples.append(f"shapenet_chair1513.ply")
-    test_samples(train_samples)
-    #overfit_bag()
+    test_samples(tester, train_samples)
+    #make_gt_of_sample_list(tester, train_samples, generate_3D=True)

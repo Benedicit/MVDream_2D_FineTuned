@@ -25,7 +25,7 @@ from mvdream.ldm.models.diffusion.ddim import DDIMSampler
 working_dir = os.path.dirname(os.path.abspath(__file__))
 
 from yanx_pointnet2_encoder import YanxPointNet2Encoder
-
+from tester import Tester3D
 import torch._dynamo
 torch._dynamo.config.cache_size_limit = 64
 
@@ -66,7 +66,7 @@ def save_training_views_grid(imgs, out_path, pad=16):
     PilImage.fromarray(canvas).save(out_path)
     print("Saved training views grid to", out_path)
 
-def make_gt_of_sample_list(samples, elev_deg=15.0, debug_dir: str = "debug/test"):
+def make_gt_of_sample_list(tester : Tester3D, samples, elev_deg=15.0, debug_dir: str = "ground_truth/", save_grid=False, save_4_views=True, generate_3D=False):
     Path(debug_dir).mkdir(parents=True, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -89,16 +89,25 @@ def make_gt_of_sample_list(samples, elev_deg=15.0, debug_dir: str = "debug/test"
         mesh_path = get_mesh_from_pc(sample)
 
         mesh = load_objs_as_meshes([mesh_path], device=device, load_textures=False)
-        verts_m = mesh.verts_packed().to(device)
-        faces_m = mesh.faces_packed().to(device)
+        verts_m = mesh.verts_packed()
+        faces_m = mesh.faces_packed()
 
-        target_imgs = renderer.render_mvdream_views(verts_m, faces_m, camera=cam).contiguous()
+        x = renderer.render_mvdream_views(verts_m, faces_m, camera=cam)
+        x = torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
+        target_imgs = (x * 255.0).permute(0, 2, 3, 1).cpu().numpy()
+        obj_path = debug_dir + name
 
-        save_training_views_grid(
-            imgs=target_imgs,
-            out_path=os.path.join(debug_dir, f"{name}_target.png"),
-        )
+        if save_grid:
+            save_training_views_grid(
+                imgs=target_imgs,
+                out_path=os.path.join(debug_dir, f"{name}_target.png"),
+            )
+        elif save_4_views:
+            tester.save_4_views(target_imgs,obj_path)
+            if generate_3D:
+                tester.views_to_3D(obj_path)
         pbar.update(1)
+        
 class LoRATrainer:
     def __init__(self, device, lora_rank, lora_alpha, num_steps=200, model_name="sd-v2.1-base-4view", H=256, W=256, ELEV_DEG=15.0, DIST=2.5, num_views=4, load_from_ckpth : bool =False, ckpt_path="checkpoints/mvdream_lora_pc_shoes_interleaved.pt"):
         #torch.compiler.reset()
@@ -197,6 +206,8 @@ class LoRATrainer:
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pc_tokens = self.projector(pc_feat_flat)
             context = torch.cat([c_text_flat, pc_tokens], dim=1)
+            #context = torch.cat([c_text_flat], dim=1)
+            #context = torch.cat([pc_tokens], dim=1)
             cond = {"context": context, "camera": camera_flat, "num_frames": V}
             eps_pred = self.model.apply_model(z_noisy, t, cond)
             loss = F.mse_loss(eps_pred, noise)
@@ -308,7 +319,6 @@ class LoRATrainer:
             if pc_feat.dim() == 1:
                 pc_feat = pc_feat.unsqueeze(0)
             pc_feat = pc_feat.detach().contiguous()
-
 
             # --- Render target multi-view images ---
             mesh_path = get_mesh_from_pc(sample)
@@ -464,7 +474,7 @@ class LoRATrainer:
 
             uc_pc_tokens = torch.zeros_like(pc_tokens)
             #uc_depth_tokens = torch.zeros_like(depth_tokens)
-            uc_context = torch.cat([uc_text, uc_pc_tokens], dim=1)
+            #uc_context = torch.cat([uc_text, uc_pc_tokens], dim=1)
         else:
             cond_context = c_text
             uc_context = uc_text
