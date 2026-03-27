@@ -8,8 +8,8 @@ from mvdream.model_zoo import build_model
 from mvdream.camera_utils import get_camera, create_camera_to_world_matrix
 from mvdream.ldm.models.diffusion.ddim import DDIMSampler
 
-from lora import add_lora_to_mvdream_unet, LoRALinear
-from test_pointnet_encoder import get_pointnet_features, PointFeatProjector, get_point_cloud_name, read_from_plyfile
+from lora import add_lora_to_cross_att_only, LoRALinear
+from pointnet_encoder import get_pointnet_features, PointFeatProjector, get_point_cloud_name, read_from_plyfile
 
 from pathlib import Path
 from rembg import new_session, remove
@@ -58,7 +58,7 @@ class Tester3D:
         self.model.to(self.device)
         self.model.device = self.device
         self.unet = self.model.model.diffusion_model
-        add_lora_to_mvdream_unet(self.unet, r=lora_rank, alpha=8.0)
+        add_lora_to_cross_att_only(self.unet, r=lora_rank, alpha=8.0)
 
         dummy_c = self.model.get_learned_conditioning(["dummy"]).to(self.device)
         context_dim = dummy_c.shape[-1]
@@ -145,8 +145,8 @@ class Tester3D:
             print(f"pc_feat mean/std={pc_feat.mean().item():.4f}/{pc_feat.std().item():.4f}")
             pc_feats_views = pc_feat.expand(num_views, -1)                         # [V,D_pc]
             pc_tokens = self.projector(pc_feats_views)                                  # [V,K,C]
-            cond_context = torch.cat([c_text, pc_tokens], dim=1)                   # [V,L+K,C]
-            #cond_context = torch.cat([pc_tokens], dim=1)                   # [V,L+K,C]
+            #cond_context = torch.cat([c_text, pc_tokens], dim=1)                   # [V,L+K,C]
+            cond_context = torch.cat([pc_tokens], dim=1)                   # [V,L+K,C]
 
 
             uc_pc_tokens = torch.zeros_like(pc_tokens)

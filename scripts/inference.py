@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 
 from tester import Tester3D
-from test_pointnet_encoder import get_point_cloud_name, get_point_cloud_name_reg
+from pointnet_encoder import get_point_cloud_name, get_point_cloud_name_reg
 from trainer import make_gt_of_sample_list
 
 working_dir = os.path.dirname(os.path.abspath(__file__))
@@ -35,7 +35,7 @@ def test_samples(tester: Tester3D, test_samples):
         imgs_pc = tester.sample_multiview(
             pointcloud_path=base_path + sample,
             prompt=f"a {prompt}",
-            use_pointcloud=False,
+            use_pointcloud=True,
             #scale=80.0
         )
         #tester.save_view_grid(imgs_pc,  f"samples/{full_name}_samples.png")

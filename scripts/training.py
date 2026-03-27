@@ -14,12 +14,15 @@ from mvdream.ldm.util import instantiate_from_config
 from mvdream.ldm.interface import LatentDiffusionInterface
 from mvdream.camera_utils import get_camera
 from mvdream.model_zoo import build_model
-from lora import add_lora_to_mvdream_unet, LoRALinear
-from test_pointnet_encoder import read_from_plyfile, get_pointnet_features, PointFeatProjector, get_point_cloud_name_reg
+from lora import add_lora_to_cross_att_only, LoRALinear
+from pointnet_encoder import read_from_plyfile, get_pointnet_features, PointFeatProjector, get_point_cloud_name_reg
 from view_renderer import PointRenderer
 from tqdm import tqdm
 from trainer import LoRATrainer, get_mesh_from_pc
 from tester import Tester3D
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 working_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -40,7 +43,8 @@ class CacheDataset(Dataset):
             "camera": item["camera"],
             "pc_feat": item["pc_feat"],
             "pc_path": item["pc_path"],  # Strings are collated into lists
-            "c_text": item["c_text"]
+            "c_text": item["c_text"],
+            "pc_latent": item["pc_latent"],
         }, s
 
 
@@ -48,13 +52,13 @@ def train_all_interleaved():
     base_path_masked = f"{working_dir}/../../data/dataset_masked/"
     train_samples = []
     
-    num_samples = 720
+    num_samples = 16
     class_names = [#"airplane",
                    #"bag",
                    #"basket",
                    #"bathtub",
                    #"bed",
-                   "bench",
+                   #"bench",
                    #"birdhouse",
                    #"bookshelf",
                    #"bottle",
@@ -64,7 +68,7 @@ def train_all_interleaved():
                    #"camera",
                    #"can",
                    #"cap",
-                   "car",
+                   #"car",
                    #"cellphone",
                    "chair",
                    #"clock",
@@ -97,7 +101,7 @@ def train_all_interleaved():
                    #"skateboard",
                    #"sofa",
                    #"stove",
-                   "table",
+                   #"table",
                    #"telephone",
                    #"tower",
                    #"train",
@@ -120,27 +124,24 @@ def train_all_interleaved():
 
     trainer = LoRATrainer(
         device="cuda",
-        lora_rank=32, # look if it works with 8
+        lora_rank=64, # look if it works with 8
         lora_alpha=8.0,
-        num_steps=800,     # not used by cached training, but keep for compatibility
         num_views=4,
         H=256,
         W=256,
         ELEV_DEG=15.0,
         DIST=2.5,
+        flow_matching=True,
         load_from_ckpth=False,
         #ckpt_path="checkpoints/mvdream_lora_pc_128_classes_chair_interleaved.pt"
     )
-    trainer.save_weights(f"checkpoints/mvdream_lora_pc_{num_samples}_classes_{class_names[0]}_raw.pt")
-    return
-
 
     train_cache = trainer.build_cache(
         train_samples=train_samples,
         base_path_masked=base_path_masked,
-        save_debug_imgs=False,        # turn off if you don't want debug renders
+        save_target_imgs=False,        # turn off if you don't want debug renders
+        save_pc_imgs=False,        # turn off if you don't want debug renders
         debug_dir="debug/cache/train",
-        use_fixed_camera=True,
     )
 
     '''
@@ -156,7 +157,7 @@ def train_all_interleaved():
 
     # Save some memory by removing pointnet++
     trainer.pointnet = None
-    num_epochs = 550
+    num_epochs = 1000
 
     val_every = 200                 # validate every N optimizer steps
     val_ddim_steps = 30             # keep small-ish for speed; use 50 if you can afford it
@@ -194,7 +195,8 @@ def train_all_interleaved():
             pbar.set_description(f"step={global_step} sample={sample} train_loss={loss:.6f}")
             pbar.update(1)
             global_step += 1
-    trainer.save_weights(f"checkpoints/mvdream_lora_pc_{num_samples}_classes_{class_names[0]}_no_pc.pt")
+    suffix = "flowmatching" if trainer.flow_matching else "diffusion"
+    trainer.save_weights(f"checkpoints/shapedream_{suffix}_{len(class_names)}_classes_{num_samples}_obj.pt")
 
 
 

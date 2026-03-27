@@ -13,8 +13,8 @@ from mvdream.ldm.util import instantiate_from_config
 from mvdream.ldm.interface import LatentDiffusionInterface
 from mvdream.camera_utils import get_camera
 from mvdream.model_zoo import build_model
-from lora import add_lora_to_mvdream_unet, LoRALinear
-from test_pointnet_encoder import read_from_plyfile, get_pointnet_features, PointFeatProjector, get_point_cloud_name, get_point_cloud_name_reg
+from lora import add_lora_to_cross_att_only, add_lora_to_attention_and_conv, add_lora_to_all_layers, LoRAConv2d, LoRALinear
+from pointnet_encoder import read_from_plyfile, get_pointnet_features, PointFeatProjector, get_point_cloud_name, get_point_cloud_name_reg
 from view_renderer import PointRenderer, MeshRendererMVDream
 from tqdm import tqdm
 from tester import Tester3D
@@ -26,9 +26,7 @@ working_dir = os.path.dirname(os.path.abspath(__file__))
 
 from yanx_pointnet2_encoder import YanxPointNet2Encoder
 from tester import Tester3D
-import torch._dynamo
-torch._dynamo.config.cache_size_limit = 64
-
+from flow_matching import FlowMatching
 
 SNAP_DIR = f"{working_dir}/../../snap_gtr"
 OUTPUT_DIR = f"{working_dir}/../debug"
@@ -107,19 +105,21 @@ def make_gt_of_sample_list(tester : Tester3D, samples, elev_deg=15.0, debug_dir:
             if generate_3D:
                 tester.views_to_3D(obj_path)
         pbar.update(1)
-        
+
 class LoRATrainer:
-    def __init__(self, device, lora_rank, lora_alpha, num_steps=200, model_name="sd-v2.1-base-4view", H=256, W=256, ELEV_DEG=15.0, DIST=2.5, num_views=4, load_from_ckpth : bool =False, ckpt_path="checkpoints/mvdream_lora_pc_shoes_interleaved.pt"):
+    def __init__(self, device, lora_rank, lora_alpha, flow_matching=True, model_name="sd-v2.1-base-4view", H=256, W=256, ELEV_DEG=15.0, DIST=2.5, num_views=4, load_from_ckpth : bool =False, ckpt_path=""):
         #torch.compiler.reset()
-        self.num_steps = num_steps
         self.device = torch.device(device)
         self.scaler = torch.amp.GradScaler('cuda')
-        #if self.device.type == "cuda":
-        #    torch.cuda.set_device(self.device.index)  # makes any internal `.cuda()` land on cuda:2
         self.model = build_model(model_name=model_name)
 
         self.unet = self.model.model.diffusion_model
-        add_lora_to_mvdream_unet(self.unet, r=lora_rank, alpha=lora_alpha)
+        self.flow_matching = flow_matching
+        if flow_matching:
+            #add_lora_to_attention_and_conv(self.unet, r=lora_rank, alpha=lora_alpha)
+            add_lora_to_all_layers(self.unet, r=lora_rank, alpha=lora_alpha)
+        else:
+            add_lora_to_cross_att_only(self.unet, r=lora_rank, alpha=lora_alpha)
 
 
         self.model.to(self.device)
@@ -129,9 +129,10 @@ class LoRATrainer:
 
         for p in self.model.parameters():
             p.requires_grad_(False)
-        
+
         # Define lora_params
         self.lora_params = []
+        lora_layer_count = 0
         for m in self.unet.modules():
             if isinstance(m, LoRALinear):
                 m.base.weight.requires_grad_(False)
@@ -141,7 +142,8 @@ class LoRATrainer:
                 m.lora_up.weight.requires_grad_(True)
                 self.lora_params.append(m.lora_down.weight)
                 self.lora_params.append(m.lora_up.weight)
-        
+                lora_layer_count += 1
+
         # Define projector properly
         dummy_c = self.model.get_learned_conditioning(["dummy"]).to(self.device)
         self.dummy_pointcloud_path = f"{working_dir}/../../data/dataset_masked/bag1.ply"
@@ -162,18 +164,19 @@ class LoRATrainer:
                 in_dim=pc_feat_dim,
                 context_dim=context_dim,
                 num_tokens=4,
-            ).to(self.device)
+        ).to(self.device)
 
 
         for p in projector.parameters():
-                p.requires_grad_(True)
+            p.requires_grad_(True)
 
         self.projector = projector
-
+        lora_param_list = list(self.lora_params)
+        print(f"LoRA parameters: {sum(p.numel() for p in lora_param_list)/1e6:.2f}, LoRA Layers: {lora_layer_count}")
 
         # Define optimizer
         #self.optimizer = torch.optim.AdamW( list(self.lora_params) + list(self.projector.parameters()) + list(self.depth_map_encoder.proj.parameters()), lr=1e-4,)
-        self.optimizer = torch.optim.AdamW( list(self.lora_params) + list(self.projector.parameters()), lr=1e-4,)
+        self.optimizer = torch.optim.AdamW( lora_param_list + list(self.projector.parameters()), lr=1e-4,)
 
         self.H = H
         self.W = W
@@ -193,26 +196,42 @@ class LoRATrainer:
             self.projector.load_state_dict(ckpt["projector"], strict=True)
             #self.depth_map_encoder.load_state_dict(ckpt["depth_map_encoder"], strict=False)
 
-        #self.pointnet = torch.compile(self.pointnet)
-        #self.model = torch.compile(self.model, mode="max-autotune")
-        #self.unet = torch.compile(self.unet, mode="max-autotune",dynamic=False)
+        self.flow_model = FlowMatching(self.device, self.model)
+        if flow_matching:
+            #self.compiled_loss = torch.compile(self._compute_loss_flow_matching, mode="max-autotune", dynamic=False,)
+            self.compiled_loss = torch.compile(self._compute_loss_flow_matching, dynamic=False,)
+        else:
+            self.compiled_loss = torch.compile(self._compute_loss_diffusion, mode="max-autotune", dynamic=False)
 
-        #self.model.model.diffusion_model = self.unet
+    def _compute_loss_flow_matching(self, z_noisy, z, pc_latent, t, c_text_flat, pc_feat_flat, camera_flat, V, noise):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            #print(f"Point cloud latent shape: {pc_latent.shape}", f"Target latent shape: {z.shape}")
+            pc_tokens = self.projector(pc_feat_flat)
+            context = torch.cat([pc_tokens], dim=1)
+            cond = {"context": context, "camera": camera_flat, "num_frames": V}
+            loss = self.flow_model.training_losses(x1=z, x0=pc_latent, cond=cond, t=t)
 
-        #self.projector = torch.compile(projector, mode="max-autotune",dynamic=False)
-        self.compiled_loss = torch.compile(self._compute_loss, mode="max-autotune", dynamic=False)#, mode="max-autotune")
+        self.optimizer.zero_grad(set_to_none=True)
+        # Scaled backward pass, theoretically not needed for BF16
+        self.scaler.scale(loss).backward()
+        self.scaler.unscale_(self.optimizer)
 
-    def _compute_loss(self, z_noisy, t, c_text_flat, pc_feat_flat, camera_flat, V, noise):
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        return loss
+
+
+    def _compute_loss_diffusion(self, z_noisy, z, pc_latent, t, c_text_flat, pc_feat_flat, camera_flat, V, noise):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pc_tokens = self.projector(pc_feat_flat)
-            context = torch.cat([c_text_flat, pc_tokens], dim=1)
+            #context = torch.cat([c_text_flat, pc_tokens], dim=1)
             #context = torch.cat([c_text_flat], dim=1)
-            #context = torch.cat([pc_tokens], dim=1)
+            context = torch.cat([pc_tokens], dim=1)
             cond = {"context": context, "camera": camera_flat, "num_frames": V}
             eps_pred = self.model.apply_model(z_noisy, t, cond)
             loss = F.mse_loss(eps_pred, noise)
         self.optimizer.zero_grad(set_to_none=True)
-        # Scaled backward pass
+        # Scaled backward pass, theoretically not needed for BF16
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)
 
@@ -269,9 +288,9 @@ class LoRATrainer:
         self,
         train_samples,
         base_path_masked: str,
-        save_debug_imgs: bool = False,
+        save_target_imgs: bool = False,
+        save_pc_imgs: bool = False,
         debug_dir: str = "debug/cache",
-        use_fixed_camera: bool = True,
     ):
         """
         Precompute and cache per-sample tensors so training can interleave samples cheaply.
@@ -315,6 +334,7 @@ class LoRATrainer:
             name = get_point_cloud_name_reg(sample, with_number=True)
 
             # --- PointNet++ feature (likely dominates if it loads from disk) ---
+            # TODO: Replace with PointCloud -> CLIP Encoder
             pc_feat = get_pointnet_features(self.pointnet, pointcloud_path=pc_path, device=device)
             if pc_feat.dim() == 1:
                 pc_feat = pc_feat.unsqueeze(0)
@@ -325,7 +345,7 @@ class LoRATrainer:
             verts_m, faces_m, _ = self.get_renderings_verts_from_file_mesh(mesh_path)
             target_imgs = self.renderer.render_mvdream_views(verts_m, faces_m, camera=cam).contiguous()
 
-            if save_debug_imgs:
+            if save_target_imgs:
                 save_training_views_grid(
                     imgs=target_imgs,
                     out_path=os.path.join(debug_dir, f"{name}_target.png"),
@@ -339,15 +359,22 @@ class LoRATrainer:
             z = z.detach().contiguous()
 
             # --- Optional debug rendering of the partial point cloud views ---
-            if save_debug_imgs:
-                pc_renderer, verts_pc = self.get_renderings_verts_from_file_pc(pc_path)
-                cond_imgs = pc_renderer.render_mvdream_views(verts_pc, camera=cam)
+            pc_renderer, verts_pc = self.get_renderings_verts_from_file_pc(pc_path)
+            pc_imgs = pc_renderer.render_mvdream_views(verts_pc, camera=cam)
+            if save_pc_imgs:
                 save_training_views_grid(
-                    imgs=cond_imgs,
+                    imgs=pc_imgs,
                     out_path=os.path.join(debug_dir, f"{name}_pc.png"),
                 )
 
-            # --- Text conditioning: compute ONCE per prompt, then repeat V ---
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                pc_latent = self.model.encode_first_stage(pc_imgs)
+                if hasattr(self.model, "get_first_stage_encoding"):
+                    pc_latent = self.model.get_first_stage_encoding(pc_latent)
+            pc_latent = pc_latent.detach().contiguous()
+
+
+            # --- Text conditioning ---
             prompt = "a " + get_point_cloud_name_reg(sample)
             c1 = text_cond_cache.get(prompt)
             if c1 is None:
@@ -368,6 +395,7 @@ class LoRATrainer:
                 "camera": cam_cpu,  # shared if fixed
                 "V": V,
                 "target_imgs": target_imgs.detach().to("cpu", non_blocking=False),
+                "pc_latent" : pc_latent.detach().to("cpu", non_blocking=False),
                 "c_text": c_text.to("cpu", non_blocking=False),
             }
 
@@ -391,32 +419,30 @@ class LoRATrainer:
         pc_feat = item["pc_feat"].to(self.device).contiguous()
         pc_paths = item["pc_path"]
         c_text = item["c_text"].to(self.device).contiguous()
+        pc_latent = item["pc_latent"].to(self.device).contiguous()
 
         B, V, C_lat, H_lat, W_lat = z.shape
 
         # Flatten B and V for the UNet: (B*V, ...)
         z_flat = z.view(B * V, C_lat, H_lat, W_lat)
+        pc_latent_flat = pc_latent.view(B * V, C_lat, H_lat, W_lat)
         camera_flat = camera.view(B * V, 16)
         c_text_flat = c_text.view(B * V, c_text.shape[-2], c_text.shape[-1])
 
-        t_scalar = torch.randint(0, self.model.num_timesteps, (B,), device=self.device)
-        t = t_scalar.repeat_interleave(V)  # (B*V,) each object in batch gets same t per view
+        if self.flow_matching:
+            t = torch.rand((B,), device=self.device)
+        else:
+            t = torch.randint(0, self.model.num_timesteps, (B,), device=self.device)
+        t = t.repeat_interleave(V)  # (B*V,) each object in batch gets same t per view
 
         noise = torch.randn_like(z_flat)
-        z_noisy = self.model.q_sample(z_flat, t, noise)
-
+        if not self.flow_matching:
+            z_noisy = self.model.q_sample(z_flat, t, noise)
+        else:
+            z_noisy = z_flat
         pc_feat_flat = pc_feat.repeat_interleave(V, dim=0).contiguous()
 
-        #prompts = []
-        #for path in pc_paths:
-       #     prompts.extend(["a " + get_point_cloud_name_reg(path)] * V)
-       # c_text = self.model.get_learned_conditioning(prompts).to(self.device)
-
-        loss = self.compiled_loss(z_noisy, t, c_text_flat, pc_feat_flat, camera_flat, V, noise)
-
-
-        #loss.backward()
-        #self.optimizer.step()
+        loss = self.compiled_loss(z_noisy, z_flat, pc_latent_flat, t, c_text_flat, pc_feat_flat, camera_flat, V, noise)
 
         return float(loss.item())
 

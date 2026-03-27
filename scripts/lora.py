@@ -3,7 +3,8 @@ import torch
 from torch import nn
 
 from typing import Iterable, Tuple
-from mvdream.ldm.modules.attention import CrossAttention, MemoryEfficientCrossAttention
+from mvdream.ldm.modules.attention import CrossAttention, MemoryEfficientCrossAttention, SpatialSelfAttention
+
 
 class LoRALinear(nn.Module):
     """
@@ -22,6 +23,7 @@ class LoRALinear(nn.Module):
         self.lora_down = nn.Linear(base.in_features, r, bias=False)
         self.lora_up   = nn.Linear(r, base.out_features, bias=False)
 
+
         nn.init.zeros_(self.lora_up.weight)
         nn.init.normal_(self.lora_down.weight, std=1e-4)
 
@@ -30,6 +32,35 @@ class LoRALinear(nn.Module):
     def forward(self, x):
         return self.base(x) + self.lora_up(self.lora_down(x)) * self.scale
 
+class LoRAConv2d(nn.Module):
+    """
+    Wrap a Conv2d layer with a low-rank LoRA adapter.
+    """
+    def __init__(self, base: nn.Conv2d, r: int = 4, alpha: float = 1.0):
+        super().__init__()
+        assert isinstance(base, nn.Conv2d)
+        self.base = base
+        self.r = r
+        self.alpha = alpha
+
+        # down-layer uses base kernel/stride/padding, up-layer is 1x1
+        self.lora_down = nn.Conv2d(
+            base.in_channels,
+            r,
+            kernel_size=base.kernel_size,
+            stride=base.stride,
+            padding=base.padding,
+            dilation=base.dilation,
+            bias=False
+        )
+        self.lora_up = nn.Conv2d(r, base.out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+
+        nn.init.zeros_(self.lora_up.weight)
+        nn.init.normal_(self.lora_down.weight, std=1e-4)
+        self.scale = alpha / r
+
+    def forward(self, x):
+        return self.base(x) + self.lora_up(self.lora_down(x)) * self.scale
 
 LORA_TARGET_DEFAULT = ("to_q", "to_k", "to_v", "to_out.0")
 
@@ -43,7 +74,7 @@ def _wrap_linear_with_lora(module: nn.Module, attr: str, r: int, alpha: float):
     wrapped = LoRALinear(base_layer, r=r, alpha=alpha)
     setattr(sub, last_name, wrapped)
 
-def add_lora_to_mvdream_unet(
+def add_lora_to_cross_att_only(
     unet: nn.Module,
     r: int = 4,
     alpha: float = 1.0,
@@ -65,3 +96,44 @@ def add_lora_to_mvdream_unet(
                 num_lora += 1
 
     return num_attn, num_lora
+
+def add_lora_to_attention_and_conv(model: nn.Module, r: int = 4, alpha: float = 1.0):
+    """
+    Add LoRA layers to attention and convolution layers in the model.
+    """
+    for name, module in model.named_children():
+
+        # 1. If it's a Convolution, wrap it directly
+        if isinstance(module, nn.Conv2d):
+            wrapped = LoRAConv2d(module, r=r, alpha=alpha)
+            setattr(model, name, wrapped)
+
+        # 2. If it's an Attention module, go inside and wrap Linears (and Convs if any)
+        elif isinstance(module, (CrossAttention, MemoryEfficientCrossAttention, SpatialSelfAttention)):
+            for sub_name, sub_module in module.named_children():
+                if isinstance(sub_module, nn.Linear):
+                    wrapped = LoRALinear(sub_module, r=r, alpha=alpha)
+                    setattr(module, sub_name, wrapped)
+                elif isinstance(sub_module, nn.Conv2d):
+                    wrapped = LoRAConv2d(sub_module, r=r, alpha=alpha)
+                    setattr(module, sub_name, wrapped)
+                else:
+                    add_lora_to_attention_and_conv(sub_module, r=r, alpha=alpha)
+
+        # 4. For generic containers (Sequential, ModuleList, Block, etc.), just recurse.
+        else:
+            add_lora_to_attention_and_conv(module, r=r, alpha=alpha)
+def add_lora_to_all_layers(model: nn.Module, r: int = 64, alpha: float = 1.0):
+    """
+    Recursively add LoRA layers to all nn.Linear and nn.Conv2d layers in the model.
+    """
+    for name, module in model.named_children():
+        if isinstance(module, nn.Linear):
+            wrapped = LoRALinear(module, r=r, alpha=alpha)
+            setattr(model, name, wrapped)
+        elif isinstance(module, nn.Conv2d):
+            wrapped = LoRAConv2d(module, r=r, alpha=alpha)
+            setattr(model, name, wrapped)
+        else:
+            # Recurse into custom modules, Sequential, ModuleList, etc.
+            add_lora_to_all_layers(module, r=r, alpha=alpha)

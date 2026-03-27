@@ -126,7 +126,7 @@ class PointRenderer(MVDreamRenderer):
 
 
     @torch.no_grad()
-    def render_mvdream_views(self, points, camera, dist_scale=2.5):
+    def render_mvdream_views(self, points, camera, dist_scale=2.5, interpolation="sine"):
         """
         Takes raw points and returns a batch of 4 orthogonal views.
 
@@ -145,42 +145,32 @@ class PointRenderer(MVDreamRenderer):
 
         points = normalize_vertices(points)
 
-        # 1. Create Pointcloud (Features/colors not strictly needed for depth)
-        point_cloud = Pointclouds(points=points)
+        if interpolation == "sine":
+            frequency = 6.0
+            v_combined = (torch.sin(points * frequency) + 1.0) * 0.5  # Range [0, 1]
+        else:
+            # Fallback to linear
+            v_combined = (points + 1.0) * 0.5
+
+        low_bound = 25.0 / 255.0
+        high_bound = 145.0 / 255.0
+
+        points_rgb = low_bound + (high_bound - low_bound) * v_combined
+
+        # Create Pointcloud with color features
+        point_cloud = Pointclouds(points=points, features=points_rgb)
         point_cloud_expanded = point_cloud.extend(4)
 
         cameras = self._mvdream_to_pytorch3d_cameras(camera, dist_scale=dist_scale, view_order="frbl")
 
-        # 2. Rasterize to get fragments
-        # fragments.zbuf shape: (B*4, H, W, K) where K is points per pixel
-        fragments = self.renderer.rasterizer(point_cloud_expanded, cameras=cameras)
+        # Render with colors
+        rendered = self.renderer(point_cloud_expanded, cameras=cameras)
 
-        # Get the depth of the closest point for each pixel
-        depth = fragments.zbuf[..., 0]
-
-        # Mask for background (PyTorch3D uses -1 for empty pixels in point rasterization)
-        mask = (fragments.idx[..., 0] > -1)
-
-        # 3. Normalize Depth to [0, 1]
-        valid_depths = depth[mask]
-        if valid_depths.numel() > 0:
-            min_d, max_d = valid_depths.min(), valid_depths.max()
-            depth_norm = (depth - min_d) / (max_d - min_d + 1e-6)
-        else:
-            depth_norm = torch.zeros_like(depth)
-
-        # 4. Apply Jet Colormap (Map 0.0=Near to Blue, 1.0=Far to Red)
-        x = depth_norm
-        r = 1 - x
-        g = torch.zeros_like(x)
-        b = x
-        depth_rgb = torch.stack([r, g, b], dim=-1)
-
-        # 5. Background and Range Formatting
-        depth_rgb[~mask] = 1.0  # White background
+        # Extract RGB channels
+        rgb = rendered[..., :3]
 
         # Return in shape (B*4, 3, H, W) and range [-1, 1]
-        out = depth_rgb.permute(0, 3, 1, 2) * 2.0 - 1.0
+        out = rgb.permute(0, 3, 1, 2) * 2.0 - 1.0
         return out
 
 
