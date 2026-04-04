@@ -20,8 +20,8 @@ class LoRALinear(nn.Module):
         self.r = r
         self.alpha = alpha
 
-        self.lora_down = nn.Linear(base.in_features, r, bias=False)
-        self.lora_up   = nn.Linear(r, base.out_features, bias=False)
+        self.lora_down = nn.Linear(base.in_features, r, bias=False, device=base.weight.device)
+        self.lora_up   = nn.Linear(r, base.out_features, bias=False, device=base.weight.device)
 
 
         nn.init.zeros_(self.lora_up.weight)
@@ -51,9 +51,10 @@ class LoRAConv2d(nn.Module):
             stride=base.stride,
             padding=base.padding,
             dilation=base.dilation,
+            device=base.weight.device,
             bias=False
         )
-        self.lora_up = nn.Conv2d(r, base.out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.lora_up = nn.Conv2d(r, base.out_channels, kernel_size=1, stride=1, padding=0, device=base.weight.device, bias=False)
 
         nn.init.zeros_(self.lora_up.weight)
         nn.init.normal_(self.lora_down.weight, std=1e-4)

@@ -3,6 +3,8 @@ import os
 import random
 import torch
 import torch.nn.functional as F
+from lightning import seed_everything
+from torch.utils.tensorboard import SummaryWriter
 
 from torch.utils.data import Dataset, DataLoader
 
@@ -38,21 +40,26 @@ class CacheDataset(Dataset):
         s = self.samples[idx]
         item = self.cache[s]
         # Return tensors directly for DataLoader collation
+        
         return {
             "z": item["z"],
-            "camera": item["camera"],
-            "pc_feat": item["pc_feat"],
-            "pc_path": item["pc_path"],  # Strings are collated into lists
+            "pc_path": item["pc_path"],
             "c_text": item["c_text"],
-            "pc_latent": item["pc_latent"],
+            "pc_feat": item["pc_feat"],
+            "camera": item["camera"],
+            "training_points": item["training_points"],
+            "training_normals": item["training_normals"],
         }, s
 
 
 def train_all_interleaved():
+    log_dir = "logs/check_overfitting"
+    writer = SummaryWriter(log_dir=log_dir)
+
     base_path_masked = f"{working_dir}/../../data/dataset_masked/"
     train_samples = []
     
-    num_samples = 16
+    num_samples = 1280
     class_names = [#"airplane",
                    #"bag",
                    #"basket",
@@ -117,9 +124,12 @@ def train_all_interleaved():
             train_samples.append(f"shapenet_{cl}{a}.ply")
     #train_samples = ["shoe1.ply", "shoe2.ply", "shoe3.ply", "shoe4.ply"]
 
-    val_samples = ["shapenet_chair250.ply", "shapenet_chair251.ply", "shapenet_chair252.ply", "shapenet_chair253.ply"
-        ,"shapenet_chair254.ply", "shapenet_table250.ply", "shapenet_lamp250.ply", "shapenet_bench250.ply", "shapenet_car250.ply"]
-    
+    val_samples = []
+    for a in range(num_samples + 50, num_samples + max(10, int(num_samples * 0.1)) + 1):
+        if a >= 600:
+            a += 20
+        for cl in class_names:
+            val_samples.append(f"shapenet_{cl}{a}.ply")
     #tester = Tester3D()
 
     trainer = LoRATrainer(
@@ -132,6 +142,7 @@ def train_all_interleaved():
         ELEV_DEG=15.0,
         DIST=2.5,
         flow_matching=True,
+        start_from_noise=False,
         load_from_ckpth=False,
         #ckpt_path="checkpoints/mvdream_lora_pc_128_classes_chair_interleaved.pt"
     )
@@ -143,29 +154,27 @@ def train_all_interleaved():
         save_pc_imgs=False,        # turn off if you don't want debug renders
         debug_dir="debug/cache/train",
     )
-
     '''
     val_cache = trainer.build_cache(
         train_samples=val_samples,
         base_path_masked=base_path_masked,
-        save_debug_imgs=True,
+        save_target_imgs=False,
+        save_pc_imgs=False,
         debug_dir="debug/cache/val",
-        use_fixed_camera=True,
     )
     '''
 
-
     # Save some memory by removing pointnet++
     trainer.pointnet = None
-    num_epochs = 1000
+    num_epochs = 500
 
     val_every = 200                 # validate every N optimizer steps
-    val_ddim_steps = 30             # keep small-ish for speed; use 50 if you can afford it
+    val_steps = 30                  # ODE steps during validation inference
     val_scale = 7.5
     val_seed = 123
-    val_num_samples = min(4, len(val_samples))  # evaluate on a subset each time
+    val_num_samples = min(8, len(val_samples))  # evaluate on a subset each time
 
-    best_val = float("inf")
+    best_val_mse = float("inf")
     batch_size = 16
 
     train_dataset = CacheDataset(train_cache, train_samples)
@@ -173,36 +182,47 @@ def train_all_interleaved():
     global_step = 0
     pbar = tqdm(total=num_epochs * len(train_samples) // batch_size)
 
+    suffix = "flowmatching" if trainer.flow_matching else "diffusion"
+
     for epoch in range(num_epochs):
         for batch_data, sample_name in train_loader:
             loss = trainer.train_one_step_from_cache(batch_data)
 
+            writer.add_scalar("Loss/train", loss, global_step)
+
             sample = sample_name[0]
-            """if step % val_every == 0 and step > 0:
-                val_loss = trainer.compute_val_masked_img_loss(
+
+            '''
+            if global_step % val_every == 0:
+                val_metrics = trainer.validation_step(
                     val_cache=val_cache,
-                    steps=val_ddim_steps,
-                    scale=val_scale,
-                    seed=val_seed,
                     num_samples=val_num_samples,
+                    steps=val_steps,
+                    cfg_scale=val_scale,
+                    seed=val_seed,
                 )
-                pbar.write(f"[VAL] step={step} masked_img_loss={val_loss:.6f}")
-                if val_loss < best_val:
-                    best_val = val_loss
-                    trainer.save_weights("checkpoints/mvdream_lora_pc_best.pt")
-                    pbar.write(f"[VAL] new best {best_val:.6f} -> saved")
-            """
+                pbar.write(
+                    f"[VAL] step={global_step}  "
+                    f"mse={val_metrics['mse']:.6f}  "
+                    #f"psnr={val_metrics['psnr']:.2f} dB"
+                )
+                writer.add_scalar("Metrics/MSE", val_metrics["mse"], global_step)
+                if val_metrics["mse"] < best_val_mse:
+                    best_val_mse = val_metrics["mse"]
+                    pbar.write(f"[VAL] New best MSE: {best_val_mse:.2f} — checkpoint saved.")
+            '''
+
             pbar.set_description(f"step={global_step} sample={sample} train_loss={loss:.6f}")
             pbar.update(1)
             global_step += 1
-    suffix = "flowmatching" if trainer.flow_matching else "diffusion"
-    trainer.save_weights(f"checkpoints/shapedream_{suffix}_{len(class_names)}_classes_{num_samples}_obj.pt")
 
+    trainer.save_weights(f"checkpoints/shapedream_{suffix}_latent_{len(class_names)}_classes_{num_samples}.pt")
+    writer.close()
 
 
 if __name__ == "__main__":
     #overfit_bag()
     torch.set_float32_matmul_precision('medium')
-    torch.manual_seed(42)
+    seed_everything(42)
     train_all_interleaved()
     #train_all()

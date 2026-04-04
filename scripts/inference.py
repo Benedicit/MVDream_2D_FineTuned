@@ -7,6 +7,11 @@ from tester import Tester3D
 from pointnet_encoder import get_point_cloud_name, get_point_cloud_name_reg
 from trainer import make_gt_of_sample_list
 
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+
 working_dir = os.path.dirname(os.path.abspath(__file__))
 print(working_dir)
 SNAP_DIR = f"{working_dir}/../../snap_gtr"
@@ -24,8 +29,12 @@ def test_samples(tester: Tester3D, test_samples):
 
     os.makedirs("samples", exist_ok=True)
 
-    tester.load_model_for_pc(pointcloud_path=base_path + test_samples[0], lora_rank=32)
-    #make_gt_of_sample_list(test_samples)
+    tester.load_model_for_pc(
+        pointcloud_path=base_path + test_samples[0],
+        lora_rank=64,
+        flow_matching=True
+    )
+    #make_gt_of_sample_list(tester, test_samples, save_grid=True, save_4_views=False, generate_3D=False)
 
     for sample in test_samples:
         
@@ -33,10 +42,12 @@ def test_samples(tester: Tester3D, test_samples):
         full_name = get_point_cloud_name_reg(sample, with_number=True)
 
         imgs_pc = tester.sample_multiview(
+            steps=50,
             pointcloud_path=base_path + sample,
             prompt=f"a {prompt}",
             use_pointcloud=True,
-            #scale=80.0
+            start_from_noise=False,
+            #scale=10.0
         )
         #tester.save_view_grid(imgs_pc,  f"samples/{full_name}_samples.png")
 
@@ -48,7 +59,7 @@ def test_samples(tester: Tester3D, test_samples):
         tester.views_to_3D(obj_path)
 
 if __name__ == "__main__":
-    tester = Tester3D(ckpt_path="checkpoints/mvdream_lora_pc_720_classes_bench_raw.pt")
+    tester = Tester3D(ckpt_path="checkpoints/shapedream_flowmatching_latent_1_classes_1280.pt")
     torch.set_float32_matmul_precision('high')
     '''
     train_samples = [
@@ -72,7 +83,7 @@ if __name__ == "__main__":
     classes = ["bench", "chair", "car", "table"]
     classes = ["chair"]
     for cl in classes:
-        for i in range(4200, 4450):
+        for i in range(4000, 4150):
             train_samples.append(f"shapenet_chair{i}.ply")
             #train_samples.append(f"shapenet_chair1513.ply")
     test_samples(tester, train_samples)

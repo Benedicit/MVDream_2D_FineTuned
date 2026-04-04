@@ -1,6 +1,8 @@
 import math
 import os
 from pathlib import Path
+
+import pytorch3d
 import torch
 import random
 import torch.nn.functional as F
@@ -9,6 +11,8 @@ from PIL import Image as PilImage
 import numpy as np
 
 from pytorch3d.io import load_objs_as_meshes, load_ply
+from pytorch3d.ops import sample_points_from_meshes
+
 from mvdream.ldm.util import instantiate_from_config
 from mvdream.ldm.interface import LatentDiffusionInterface
 from mvdream.camera_utils import get_camera
@@ -21,6 +25,7 @@ from tester import Tester3D
 import pandas as pd
 from tester import Tester3D
 from mvdream.ldm.models.diffusion.ddim import DDIMSampler
+from pc_encoder import PointCloudEncoder
 
 working_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -91,23 +96,39 @@ def make_gt_of_sample_list(tester : Tester3D, samples, elev_deg=15.0, debug_dir:
         faces_m = mesh.faces_packed()
 
         x = renderer.render_mvdream_views(verts_m, faces_m, camera=cam)
-        x = torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
-        target_imgs = (x * 255.0).permute(0, 2, 3, 1).cpu().numpy()
-        obj_path = debug_dir + name
+
 
         if save_grid:
             save_training_views_grid(
-                imgs=target_imgs,
+                imgs=x,
                 out_path=os.path.join(debug_dir, f"{name}_target.png"),
             )
         elif save_4_views:
+            x = torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
+            target_imgs = (x * 255.0).permute(0, 2, 3, 1).cpu().numpy()
+            obj_path = debug_dir + name
             tester.save_4_views(target_imgs,obj_path)
             if generate_3D:
                 tester.views_to_3D(obj_path)
         pbar.update(1)
 
 class LoRATrainer:
-    def __init__(self, device, lora_rank, lora_alpha, flow_matching=True, model_name="sd-v2.1-base-4view", H=256, W=256, ELEV_DEG=15.0, DIST=2.5, num_views=4, load_from_ckpth : bool =False, ckpt_path=""):
+    def __init__(self,
+                 device,
+                 lora_rank,
+                 lora_alpha,
+                 flow_matching=True,
+                 start_from_noise=True,
+                 model_name="sd-v2.1-base-4view",
+                 H=256,
+                 W=256,
+                 ELEV_DEG=15.0,
+                 DIST=2.5,
+                 AZIM_START=0.0,
+                 AZIM_SPAN=360.0,
+                 num_views=4,
+                 load_from_ckpth: bool = False,
+                 ckpt_path=""):
         #torch.compiler.reset()
         self.device = torch.device(device)
         self.scaler = torch.amp.GradScaler('cuda')
@@ -115,8 +136,9 @@ class LoRATrainer:
 
         self.unet = self.model.model.diffusion_model
         self.flow_matching = flow_matching
+        self.start_from_noise = start_from_noise
+
         if flow_matching:
-            #add_lora_to_attention_and_conv(self.unet, r=lora_rank, alpha=lora_alpha)
             add_lora_to_all_layers(self.unet, r=lora_rank, alpha=lora_alpha)
         else:
             add_lora_to_cross_att_only(self.unet, r=lora_rank, alpha=lora_alpha)
@@ -169,18 +191,24 @@ class LoRATrainer:
 
         for p in projector.parameters():
             p.requires_grad_(True)
-
         self.projector = projector
+
+        self.pc_encoder = PointCloudEncoder()
+        for p in self.pc_encoder.projector.parameters():
+            p.requires_grad_(True)
+
         lora_param_list = list(self.lora_params)
         print(f"LoRA parameters: {sum(p.numel() for p in lora_param_list)/1e6:.2f}, LoRA Layers: {lora_layer_count}")
 
         # Define optimizer
         #self.optimizer = torch.optim.AdamW( list(self.lora_params) + list(self.projector.parameters()) + list(self.depth_map_encoder.proj.parameters()), lr=1e-4,)
-        self.optimizer = torch.optim.AdamW( lora_param_list + list(self.projector.parameters()), lr=1e-4,)
+        self.optimizer = torch.optim.AdamW( lora_param_list + list(self.projector.parameters()) + list(self.pc_encoder.projector.parameters()) , lr=1e-4,)
 
         self.H = H
         self.W = W
         self.ELEV_DEG = ELEV_DEG
+        self.AZIM_START = AZIM_START
+        self.AZIM_SPAN = AZIM_SPAN
         self.DIST = DIST
         self.num_views = num_views
 
@@ -196,20 +224,52 @@ class LoRATrainer:
             self.projector.load_state_dict(ckpt["projector"], strict=True)
             #self.depth_map_encoder.load_state_dict(ckpt["depth_map_encoder"], strict=False)
 
-        self.flow_model = FlowMatching(self.device, self.model)
-        if flow_matching:
+        self.pytorch3d_io = pytorch3d.io.IO()
+
+        if self.flow_matching:
+            #add_lora_to_attention_and_conv(self.unet, r=lora_rank, alpha=lora_alpha)
+            self.sampler = FlowMatching(self.device, self.model)
+            self.compiled_loss = torch.compile(self._compute_loss_flow_matching, dynamic=False, disable=True)
+            self.compiled_wrapper = torch.compile(self.training_wrapper, mode="max-autotune", dynamic=False,)
+            # TODO: Split compile in pc-encoding and mvdream finetuning
             #self.compiled_loss = torch.compile(self._compute_loss_flow_matching, mode="max-autotune", dynamic=False,)
-            self.compiled_loss = torch.compile(self._compute_loss_flow_matching, dynamic=False,)
         else:
+            self.sampler = DDIMSampler(self.model)
             self.compiled_loss = torch.compile(self._compute_loss_diffusion, mode="max-autotune", dynamic=False)
 
-    def _compute_loss_flow_matching(self, z_noisy, z, pc_latent, t, c_text_flat, pc_feat_flat, camera_flat, V, noise):
+    def training_wrapper(self, x1, x0, cond, t):
+        return self.sampler.training_losses(x1=x1, x0=x0, cond=cond, t=t)
+
+    def _compute_loss_flow_matching(self, z_noisy, z, pc, t, c_text_flat, pc_feat_flat, camera_flat, V, noise):
+        assert self.flow_matching
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             #print(f"Point cloud latent shape: {pc_latent.shape}", f"Target latent shape: {z.shape}")
             pc_tokens = self.projector(pc_feat_flat)
+            if random.random() < 0.1:
+                pc_tokens = torch.zeros_like(pc_tokens)
+
             context = torch.cat([pc_tokens], dim=1)
             cond = {"context": context, "camera": camera_flat, "num_frames": V}
-            loss = self.flow_model.training_losses(x1=z, x0=pc_latent, cond=cond, t=t)
+            if self.start_from_noise:
+                loss = self.sampler.training_losses(x1=z, x0=None, cond=cond, t=t)
+            else:
+                pc_latent = self.pc_encoder(coords=pc["points"], normals=pc["normals"], batch_lengths=pc["batch_lengths"])
+                # add some noise to make it more random and as regularization
+                noise = torch.randn_like(pc_latent) * 0.15
+
+                #loss = self.sampler.training_losses(x1=z, x0=pc_latent + noise, cond=cond, t=t)
+                loss = self.compiled_wrapper(x1=z, x0=pc_latent + noise, cond=cond, t=t)
+
+                # KL-like Regularization: ensure pc_latent distribution matches N(0, 1)
+                latent_mean = torch.mean(pc_latent)
+                latent_std = torch.std(pc_latent)
+
+                reg_loss = latent_mean ** 2 + (latent_std - 1) ** 2
+
+                # Add regularization with a small weight
+                loss = loss + 0.1 * reg_loss
+
 
         self.optimizer.zero_grad(set_to_none=True)
         # Scaled backward pass, theoretically not needed for BF16
@@ -221,7 +281,7 @@ class LoRATrainer:
         return loss
 
 
-    def _compute_loss_diffusion(self, z_noisy, z, pc_latent, t, c_text_flat, pc_feat_flat, camera_flat, V, noise):
+    def _compute_loss_diffusion(self, z_noisy, z, pc, t, c_text_flat, pc_feat_flat, camera_flat, V, noise):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pc_tokens = self.projector(pc_feat_flat)
             #context = torch.cat([c_text_flat, pc_tokens], dim=1)
@@ -259,14 +319,14 @@ class LoRATrainer:
         # 1. Load vertices and faces
         if mesh_path.endswith(".ply"):
             verts, faces = load_ply(mesh_path)
+            verts = verts.to(self.device)
+            faces = faces.to(self.device)
         else:
             # For .obj files, load_objs_as_meshes is often more robust
             mesh = load_objs_as_meshes([mesh_path], device=self.device, load_textures=textures)
             verts = mesh.verts_packed()
             faces = mesh.faces_packed()
 
-        verts = verts.to(self.device)
-        faces = faces.to(self.device)
 
         # 3. Initialize the Mesh Renderer
 
@@ -280,7 +340,12 @@ class LoRATrainer:
         """
         os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
         #torch.save({"unet": self.unet.state_dict(), "projector": self.projector.state_dict(), "depth_map_encoder": self.depth_map_encoder.state_dict()}, ckpt_path)
-        torch.save({"unet": self.unet.state_dict(), "projector": self.projector.state_dict()}, ckpt_path)
+        torch.save(
+            {
+            "unet": self.unet.state_dict(),
+            "projector": self.projector.state_dict(),
+            "pc_encoder" : self.pc_encoder.state_dict()
+            }, ckpt_path)
         print("Saved", ckpt_path)
 
     @torch.no_grad()
@@ -342,8 +407,13 @@ class LoRATrainer:
 
             # --- Render target multi-view images ---
             mesh_path = get_mesh_from_pc(sample)
-            verts_m, faces_m, _ = self.get_renderings_verts_from_file_mesh(mesh_path)
+            verts_m, faces_m, mesh_obj = self.get_renderings_verts_from_file_mesh(mesh_path)
             target_imgs = self.renderer.render_mvdream_views(verts_m, faces_m, camera=cam).contiguous()
+
+            with torch.no_grad():
+                sampled_points, sampled_normals = sample_points_from_meshes(mesh_obj, num_samples=8192, return_normals=True)
+                sampled_points = sampled_points.squeeze(0).cpu() # (8192, 3)
+                sampled_normals = sampled_normals.squeeze(0).cpu() # (8192, 3)
 
             if save_target_imgs:
                 save_training_views_grid(
@@ -351,7 +421,7 @@ class LoRATrainer:
                     out_path=os.path.join(debug_dir, f"{name}_target.png"),
                 )
 
-            # --- Encode first stage (use AMP on GPU) ---
+            # --- Encode first stage ---
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 z = self.model.encode_first_stage(target_imgs)
                 if hasattr(self.model, "get_first_stage_encoding"):
@@ -366,13 +436,6 @@ class LoRATrainer:
                     imgs=pc_imgs,
                     out_path=os.path.join(debug_dir, f"{name}_pc.png"),
                 )
-
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                pc_latent = self.model.encode_first_stage(pc_imgs)
-                if hasattr(self.model, "get_first_stage_encoding"):
-                    pc_latent = self.model.get_first_stage_encoding(pc_latent)
-            pc_latent = pc_latent.detach().contiguous()
-
 
             # --- Text conditioning ---
             prompt = "a " + get_point_cloud_name_reg(sample)
@@ -389,13 +452,15 @@ class LoRATrainer:
             # --- Move cached tensors to CPU ---
             cache[sample] = {
                 "pc_path": pc_path,
-                "name": name,
+                "pc" : verts_pc,
+                #"name": name,
+                "training_points": sampled_points,
+                "training_normals": sampled_normals,
                 "pc_feat": pc_feat.to("cpu", non_blocking=False),
                 "z": z.to("cpu", non_blocking=False),
                 "camera": cam_cpu,  # shared if fixed
-                "V": V,
-                "target_imgs": target_imgs.detach().to("cpu", non_blocking=False),
-                "pc_latent" : pc_latent.detach().to("cpu", non_blocking=False),
+                #"V": V,
+                #"target_imgs": target_imgs.detach().to("cpu", non_blocking=False),
                 "c_text": c_text.to("cpu", non_blocking=False),
             }
 
@@ -411,6 +476,8 @@ class LoRATrainer:
             loss_value (float)
         """
         self.model.train()
+        self.projector.train()
+        self.pc_encoder.train()
 
         #V = int(item.get("V", self.num_views))
 
@@ -418,14 +485,45 @@ class LoRATrainer:
         camera = item["camera"].to(self.device).contiguous()
         pc_feat = item["pc_feat"].to(self.device).contiguous()
         pc_paths = item["pc_path"]
+        points = item["training_points"].to(self.device).contiguous()
+        normals = item["training_normals"].to(self.device).contiguous()
+
+
         c_text = item["c_text"].to(self.device).contiguous()
-        pc_latent = item["pc_latent"].to(self.device).contiguous()
 
         B, V, C_lat, H_lat, W_lat = z.shape
 
+        point_list = []
+        normal_list = []
+        lengths = []
+
+        # --- Vectorized Augmentation ---
+        B_pts, N_pool, _ = points.shape
+        split_axis = 0 if random.random() < 0.5 else 2
+        offset = random.random() * 0.015 - 0.01
+        percentage_kept = 0.75
+
+        # Compute masks for the whole batch at once
+        axis_mask = points[..., split_axis] > offset
+        dropout_mask = torch.rand((B_pts, N_pool), device=self.device) < (4096 / N_pool * percentage_kept)
+        combined_mask = axis_mask & dropout_mask # [B, N]
+
+        # Flatten to filter efficiently
+        flat_points = points[combined_mask]
+        flat_normals = normals[combined_mask]
+
+        # Calculate lengths per batch element without a loop
+        lengths = combined_mask.sum(dim=1).cpu().tolist()
+
+
+        point_clouds = {
+            "points": flat_points,
+            "normals": flat_normals,
+            "batch_lengths": lengths
+        }
+
         # Flatten B and V for the UNet: (B*V, ...)
         z_flat = z.view(B * V, C_lat, H_lat, W_lat)
-        pc_latent_flat = pc_latent.view(B * V, C_lat, H_lat, W_lat)
         camera_flat = camera.view(B * V, 16)
         c_text_flat = c_text.view(B * V, c_text.shape[-2], c_text.shape[-1])
 
@@ -436,96 +534,184 @@ class LoRATrainer:
         t = t.repeat_interleave(V)  # (B*V,) each object in batch gets same t per view
 
         noise = torch.randn_like(z_flat)
+
         if not self.flow_matching:
             z_noisy = self.model.q_sample(z_flat, t, noise)
         else:
             z_noisy = z_flat
         pc_feat_flat = pc_feat.repeat_interleave(V, dim=0).contiguous()
 
-        loss = self.compiled_loss(z_noisy, z_flat, pc_latent_flat, t, c_text_flat, pc_feat_flat, camera_flat, V, noise)
+        loss = self.compiled_loss(z_noisy, z_flat, point_clouds, t, c_text_flat, pc_feat_flat, camera_flat, V, noise)
 
         return float(loss.item())
 
     @torch.no_grad()
-    def sample_multiview_2(
-        self,
-        pointcloud_path: str,
-        prompt: str = "a shoe",
-        use_pointcloud: bool = True,
-        num_views: int = 4,
-        H: int = 256,
-        W: int = 256,
-        steps: int = 50,
-        scale: float = 7.5,
-        seed: int = 42,
-        return_torch: bool = False,
-    ):
-        self.model.to(self.device)
-        self.model.device = self.device
+    def validation_step(
+            self,
+            val_cache: dict,
+            num_samples: int = None,
+            steps: int = 30,
+            cfg_scale: float = 7.5,
+            seed: int = 0,
+    ) -> dict:
+        """
+        Run a full inference pass on validation samples and compare against
+        the cached ground-truth images decoded from the VAE.
+
+        Args:
+            val_cache:   dict produced by build_cache()
+            num_samples: if set, evaluate only this many randomly chosen samples
+            steps:       number of ODE/DDIM steps for generation
+            cfg_scale:   classifier-free guidance scale
+            seed:        RNG seed for reproducible noise
+
+        Returns:
+            dict with keys "mse" ("psnr" (mean over samples))
+        """
         self.model.eval()
 
-        torch.manual_seed(seed)
-        sampler = DDIMSampler(self.model)
+        samples = list(val_cache.keys())
+        if num_samples is not None:
+            samples = random.sample(samples, min(num_samples, len(samples)))
+
+        total_mse = 0.0
+        total_psnr = 0.0
+
+        for sample in samples:
+            item = val_cache[sample]
+
+            pc_feat   = item["pc_feat"].to(self.device).contiguous()   # (1, D)
+            pc_latent = item["pc_latent"].to(self.device).contiguous() # (V, C, h, w)
+            z_gt      = item["z"].to(self.device).contiguous()         # (1, V, C, h, w) or (V, C, h, w)
+            V         = int(item["V"])
+
+            # --- decode ground-truth latents to pixel space ---
+            z_gt_flat = z_gt.view(V, *z_gt.shape[-3:])
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                gt_pixels = self.model.decode_first_stage(z_gt_flat)   # (V, 3, H, W) in [-1,1]
+
+            gt_pixels = torch.clamp((gt_pixels + 1.0) / 2.0, 0.0, 1.0)
+            gt_pixels = (gt_pixels * 255.0).permute(0, 2, 3, 1).to(torch.float32)
+
+            # --- generate images from the point cloud ---
+            torch.manual_seed(seed)
+            pc_feat_single = pc_feat[0] if pc_feat.ndim == 3 else pc_feat  # (1, D)
+            pc_latent_views = pc_latent.view(V, *pc_latent.shape[-3:])
+
+            gen_pixels = self.sample_multiview(
+                pc_feat=pc_feat_single,
+                pc_latent=pc_latent_views,
+                use_pointcloud=True,
+                num_views=V,
+                H=self.H,
+                W=self.W,
+                steps=steps,
+                scale=cfg_scale,
+            )  # (V, H, W, 3) uint8
+
+
+            # --- pixel-space metrics ---
+            mse = F.mse_loss(gen_pixels, gt_pixels).item()
+            total_mse += mse
+            """
+            # PSNR in [0,1] range: convert from [-1,1] first
+            gt_01  = (gt_pixels  + 1.0) / 2.0
+            gen_01 = (gen_pixels + 1.0) / 2.0
+            mse_01 = F.mse_loss(gen_01, gt_01).item()
+            psnr   = 10.0 * math.log10(1.0 / (mse_01 + 1e-8))
+            total_psnr += psnr
+            """
+
+        n = len(samples)
+        #return {"mse": total_mse / n, "psnr": total_psnr / n}
+        return {"mse": total_mse / n}
+
+
+    @torch.no_grad()
+    def sample_multiview(
+            self,
+            pc_feat: torch.Tensor,
+            pc_latent: torch.Tensor,
+            prompt: str = "an object",
+            use_pointcloud: bool = True,
+            num_views: int = 4,
+            H: int = 256,
+            W: int = 256,
+            steps: int = 100,
+            scale: float = 7.5,
+    ):
+        """
+        Sample num_views images from MVDream with or without PointNet++ conditioning.
+        Returns [V, H, W, 3] uint8 numpy.
+        """
+
+
+        self.model.eval()
 
         latent_shape = [4, H // 8, W // 8]
         batch_size = num_views
 
-        c_text = self.model.get_learned_conditioning([prompt] * num_views).to(self.device)
-        uc_text = self.model.get_learned_conditioning([""] * num_views).to(self.device)
-
-        camera = get_camera(
+        self.camera = get_camera(
             num_frames=num_views,
             elevation=self.ELEV_DEG,
-            azimuth_start=0.0,
-            azimuth_span=360.0,  
-            blender_coord=True,
+            azimuth_start=self.AZIM_START,
+            azimuth_span=self.AZIM_SPAN,
+            blender_coord=False,
         ).to(self.device)
 
         if use_pointcloud:
-            pc_feat = get_pointnet_features(self.pointnet, pointcloud_path=pointcloud_path, device=self.device)
-            if pc_feat.dim() == 1:
-                pc_feat = pc_feat.unsqueeze(0)
-            pc_feats_views = pc_feat.repeat(num_views, 1)
 
-            pc_tokens = self.projector(pc_feats_views)
+            pc_feats_views = pc_feat.expand(num_views, -1)                         # [V,D_pc]
+            pc_tokens = self.projector(pc_feats_views)                                  # [V,K,C]
+            cond_context = torch.cat([pc_tokens], dim=1).to(self.device)         # [V,K,C]
 
-            renderer, verts = self.get_renderings_verts_from_file_pc(pointcloud_path)
-            condition_imgs = renderer.render_mvdream_views(verts, camera=camera)
+            uc_pc_tokens = torch.zeros_like(pc_tokens, device=self.device)
+            uc_context = torch.cat([uc_pc_tokens], dim=1).to(self.device)                    # [V,L+K,C]
 
-            #depth_tokens = self.depth_map_encoder(condition_imgs)  # expect (V,T,C)
-            #depth_tokens = depth_tokens.repeat_interleave(4, dim=0)
-
-            #cond_context = torch.cat([c_text, pc_tokens, depth_tokens], dim=1)
-            cond_context = torch.cat([c_text, pc_tokens], dim=1)
-
-            uc_pc_tokens = torch.zeros_like(pc_tokens)
-            #uc_depth_tokens = torch.zeros_like(depth_tokens)
-            #uc_context = torch.cat([uc_text, uc_pc_tokens], dim=1)
         else:
-            cond_context = c_text
-            uc_context = uc_text
+            c_text = self.model.get_learned_conditioning([prompt] * num_views).to(self.device)   # [V,L,C]
+            uc_text = self.model.get_learned_conditioning([""] * num_views).to(self.device)     # [V,L,C]
+            cond_context = c_text                                                  # [V,L,C]
+            uc_context = uc_text                                                   # [V,L,C]
 
-        cond = {"context": cond_context, "camera": camera, "num_frames": num_views}
-        uc = {"context": uc_context, "camera": camera, "num_frames": num_views}
+        cond = {
+            "context": cond_context,
+            "camera": self.camera,
+            "num_frames": num_views,
+        }
 
-        samples, _ = sampler.sample(
-            S=steps,
-            conditioning=cond,
-            batch_size=batch_size,
-            shape=latent_shape,
-            verbose=False,
-            unconditional_guidance_scale=scale,
-            unconditional_conditioning=uc,
-            eta=0.0,
-            x_T=None,
-        )
+        uc = {
+            "context": uc_context,
+            "camera": self.camera,
+            "num_frames": num_views,
+        }
+        if self.flow_matching:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                args = {
+                    "num_steps" : steps,
+                    "cfg_scale" : scale,
+                    "cond" : cond,
+                    "uc_cond" : uc,
+                }
+                if self.start_from_noise:
+                    x_source = torch.randn_like(pc_latent)
+                x_source = x_source.to(self.device)
+                samples = self.sampler.generate(x=x_source, sample_kwargs=args)
+        else:
+            with torch.amp.autocast("cuda", torch.bfloat16):
+                samples, _ = self.sampler.sample(
+                    S=steps,
+                    conditioning=cond,
+                    batch_size=batch_size,
+                    shape=latent_shape,
+                    verbose=False,
+                    unconditional_guidance_scale=scale,
+                    unconditional_conditioning=uc,
+                    eta=0.0,
+                    x_T=None,
+                )
+        x = self.model.decode_first_stage(samples)
+        x = torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
+        x = (x * 255.0).permute(0, 2, 3, 1)
 
-        x = self.model.decode_first_stage(samples)  # (V,3,H,W) in [-1,1]
-
-        if return_torch:
-            return x  # torch, [-1,1]
-
-        # old uint8 path
-        x01 = torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
-        x_np = (x01 * 255.0).permute(0, 2, 3, 1).cpu().numpy()
-        return x_np.astype(np.uint8)
+        return x.to(torch.float32)
