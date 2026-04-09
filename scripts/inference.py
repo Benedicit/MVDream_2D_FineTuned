@@ -2,6 +2,7 @@ import os
 import sys
 from pathlib import Path
 import torch
+from lightning import seed_everything
 
 from tester import Tester3D
 from pointnet_encoder import get_point_cloud_name, get_point_cloud_name_reg
@@ -10,7 +11,7 @@ from trainer import make_gt_of_sample_list
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning)
-
+torch._dynamo.config.capture_scalar_outputs = True
 
 working_dir = os.path.dirname(os.path.abspath(__file__))
 print(working_dir)
@@ -46,7 +47,7 @@ def test_samples(tester: Tester3D, test_samples):
             pointcloud_path=base_path + sample,
             prompt=f"a {prompt}",
             use_pointcloud=True,
-            start_from_noise=False,
+            start_from_noise=True,
             #scale=10.0
         )
         #tester.save_view_grid(imgs_pc,  f"samples/{full_name}_samples.png")
@@ -59,7 +60,8 @@ def test_samples(tester: Tester3D, test_samples):
         tester.views_to_3D(obj_path)
 
 if __name__ == "__main__":
-    tester = Tester3D(ckpt_path="checkpoints/shapedream_flowmatching_latent_1_classes_1280.pt")
+    seed_everything(42)
+    tester = Tester3D(ckpt_path="checkpoints/shapedream_flowmatching_utonia_1_classes_560.pt")
     torch.set_float32_matmul_precision('high')
     '''
     train_samples = [
@@ -83,7 +85,7 @@ if __name__ == "__main__":
     classes = ["bench", "chair", "car", "table"]
     classes = ["chair"]
     for cl in classes:
-        for i in range(4000, 4150):
+        for i in range(4000, 4050):
             train_samples.append(f"shapenet_chair{i}.ply")
             #train_samples.append(f"shapenet_chair1513.ply")
     test_samples(tester, train_samples)

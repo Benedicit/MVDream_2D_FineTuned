@@ -1,24 +1,23 @@
 import os
+import random
 import sys
+from pathlib import Path
 
 import pytorch3d
 import torch
-import numpy as np
-from PIL import Image, ImageFilter, ImageOps
-
-from mvdream.model_zoo import build_model
-from mvdream.camera_utils import get_camera, create_camera_to_world_matrix
-from mvdream.ldm.models.diffusion.ddim import DDIMSampler
-
-from lora import add_lora_to_cross_att_only, add_lora_to_all_layers
-from pointnet_encoder import get_pointnet_features, PointFeatProjector, get_point_cloud_name, read_from_plyfile
-
-from pathlib import Path
+from PIL import Image, ImageOps
+from pytorch3d.io import load_objs_as_meshes
+from pytorch3d.ops import sample_points_from_meshes
 from rembg import new_session, remove
 
-from yanx_pointnet2_encoder import YanxPointNet2Encoder
 from flow_matching import FlowMatching
-
+from lora import add_lora_to_cross_att_only, add_lora_to_all_layers
+from mvdream.camera_utils import get_camera, create_camera_to_world_matrix
+from mvdream.ldm.models.diffusion.ddim import DDIMSampler
+from mvdream.model_zoo import build_model
+from pc_encoder import PointCloudTransformer
+from pointnet_encoder import get_pointnet_features, PointFeatProjector, read_from_plyfile
+from yanx_pointnet2_encoder import YanxPointNet2Encoder
 
 working_dir = str(Path(__file__).parent.parent.parent.absolute())
 print(working_dir)
@@ -31,15 +30,28 @@ sys.path.insert(0, SHAPEDREAM_DIR)
 if SNAP_DIR not in sys.path:
     sys.path.insert(0, str(SNAP_DIR))
 
-from snap_gtr.scripts import inference, prepare_mv
+from snap_gtr.scripts import inference
 
-from view_renderer import PointRenderer, MeshRendererMVDream
+from view_renderer import PointRenderer
 import math
 import numpy as np
 from pathlib import Path
 from transformers import AutoModelForImageSegmentation
 
 from pc_encoder import PointCloudEncoder
+
+import pandas as pd
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+gso_csv = f"{script_dir}/../../data/gso_label_to_mesh.csv"
+shapenet_csv = f"{script_dir}/../../data/shapenet_label_to_mesh.csv"
+mapping_gso = pd.read_csv(gso_csv)
+mapping_shapenet = pd.read_csv(shapenet_csv)
+
+def get_mesh_from_pc(pointcloud_name="bag1.ply"):
+    if pointcloud_name.startswith("shapenet"):
+        return mapping_shapenet.loc[mapping_shapenet["label"] == pointcloud_name, "filename"].iloc[0]
+    return mapping_gso.loc[mapping_gso["label"] == pointcloud_name, "filename"].iloc[0]
 
 class Tester3D:
     def __init__(self, ckpt_path = "checkpoints/mvdream_lora_pc_shoes_multiview.pt", ELEV_DEG=15.0, AZIM_START=0.0, AZIM_SPAN=360.0):
@@ -83,36 +95,32 @@ class Tester3D:
 
         #self.depth_map_encoder = DepthViTTokenEncoder(token_dim=context_dim, tokens_per_view=1, num_views=4).to(
             #self.device)
-        self.projector = PointFeatProjector(
+        projector = PointFeatProjector(
         in_dim=pc_feat_dim,
         context_dim=context_dim,
         num_tokens=4,
         ).to(self.device)
-
-        self.pc_encoder = PointCloudEncoder()
+        self.projector = PointCloudTransformer()
+        self.encoder = PointCloudEncoder()
 
         # load module
         ckpt = torch.load(self.ckpt_path, map_location="cpu")
         self.unet.load_state_dict(ckpt["unet"], strict=False)
         self.projector.load_state_dict(ckpt["projector"], strict=True)
-        try:
-            # Backwards compatibility
-            self.pc_encoder.load_state_dict(ckpt["pc_encoder"], strict=True)
-            self.pc_encoder.eval()
-        except KeyError:
-            print("No pc_encoder weights found in checkpoint, skipping loading")
-
 
         self.model.device = self.device
         self.model.eval()
         self.projector.eval()
 
+
         self.flow_matching = flow_matching
 
         if self.flow_matching:
             self.sampler = FlowMatching(self.device, self.model)
+            self.sampler.eval()
         else:
             self.sampler = DDIMSampler(self.model)
+
 
     def get_renderings_verts_from_file_pc(self, pointcloud_path=None):
         """
@@ -146,15 +154,45 @@ class Tester3D:
         Returns [V, H, W, 3] uint8 numpy.
         """
 
-
-        torch.manual_seed(seed)
-
-
         latent_shape = [4, H // 8, W // 8]
         batch_size = num_views
 
         c_text = self.model.get_learned_conditioning([prompt] * num_views).to(self.device)   # [V,L,C]
         uc_text = self.model.get_learned_conditioning([""] * num_views).to(self.device)     # [V,L,C]
+
+        pc_file = Path(pointcloud_path).name
+        mesh_path = get_mesh_from_pc(pc_file)
+        mesh = load_objs_as_meshes([mesh_path], device=self.device)
+        points, normals = sample_points_from_meshes(mesh, num_samples=8124, return_normals=True)
+
+        # --- Vectorized Augmentation ---
+        B_pts, N_pool, _ = points.shape
+        split_axis = 0 if random.random() < 0.5 else 2
+        offset = random.random() * 0.015 - 0.01
+        percentage_kept = 0.75
+
+        # Compute masks for the whole batch at once
+        axis_mask = points[..., split_axis] > offset
+        dropout_mask = torch.rand((B_pts, N_pool), device=self.device) < (4096 / N_pool * percentage_kept)
+        combined_mask = axis_mask & dropout_mask # [B, N]
+
+        # Flatten to filter efficiently
+        flat_points = points[combined_mask]
+        flat_normals = normals[combined_mask]
+
+        # Calculate lengths per batch element without a loop
+        lengths = combined_mask.sum(dim=1)
+        batch_idx = torch.repeat_interleave(torch.arange(B_pts, device=lengths.device), lengths)
+        print(flat_points.shape, flat_normals.shape, batch_idx.shape)
+
+        pc = {
+            "points": flat_points,
+            "normals": flat_normals,
+            "batch_idx": batch_idx
+        }
+        self.encoder.B = B_pts
+
+        utonia_features, batch_idx = self.encoder(coords=pc["points"], batch_idx=pc["batch_idx"])
 
 
         self.camera = get_camera(
@@ -165,15 +203,13 @@ class Tester3D:
             blender_coord=False,
         ).to(self.device)
 
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            cameras = self.camera
+            pc_tokens, pc_latent = self.projector(utonia_features, cameras, batch_idx)  # [V,K,C]
         if use_pointcloud:
-            pc_feat = get_pointnet_features(self.pointnet, pointcloud_path=pointcloud_path, device=self.device)
 
-            print(f"pc_feat mean/std={pc_feat.mean().item():.4f}/{pc_feat.std().item():.4f}")
-            pc_feats_views = pc_feat.expand(num_views, -1)                         # [V,D_pc]
-            pc_tokens = self.projector(pc_feats_views)                                  # [V,K,C]
             #cond_context = torch.cat([c_text, pc_tokens], dim=1)                   # [V,L+K,C]
             cond_context = torch.cat([pc_tokens], dim=1).to(self.device)                   # [V,L+K,C]
-
 
             uc_pc_tokens = torch.zeros_like(pc_tokens, device=self.device)
             uc_context = torch.cat([uc_pc_tokens], dim=1).to(self.device)                    # [V,L+K,C]
@@ -201,34 +237,19 @@ class Tester3D:
                 if hasattr(self.model, "get_first_stage_encoding"):
                     x_source = self.model.get_first_stage_encoding(x_source)
                 x_source = torch.randn_like(x_source)
+            else:
+                noise = torch.randn_like(pc_latent) * 0.15
+                x_source = pc_latent + noise
+
+            args = {
+                "num_steps" : steps,
+                "cfg_scale" : scale,
+                "cond" : cond,
+                "uc_cond" : uc,
+            }
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                args = {
-                    "num_steps" : steps,
-                    "cfg_scale" : scale,
-                    "cond" : cond,
-                    "uc_cond" : uc,
-                }
-                if not start_from_noise:
-                    point_list = []
-                    normal_list = []
-                    lengths = []
-                    for path in [pointcloud_path]:
-                        point_cloud = self.pytorch3d_io.load_pointcloud(path, device=self.device)
-                        normals = point_cloud.estimate_normals().reshape(-1, 3)
-                        points = point_cloud.points_packed()
-                        point_list.append(points)
-                        normal_list.append(normals)
-                        lengths.append(points.shape[0])
+                samples = self.sampler.generate(x=x_source, sample_kwargs=args)
 
-                    pc = {
-                        "points": point_list,
-                        "normals": normal_list,
-                        "batch_lengths": lengths
-                    }
-                    x_source = self.pc_encoder(coords=pc["points"], normals=pc["normals"], batch_lengths=pc["batch_lengths"])
-                    noise = torch.randn_like(x_source) * 0.15
-
-                samples = self.sampler.generate(x=x_source + noise, sample_kwargs=args)
         else:
             with torch.amp.autocast("cuda", torch.bfloat16):
                 samples, _ = self.sampler.sample(

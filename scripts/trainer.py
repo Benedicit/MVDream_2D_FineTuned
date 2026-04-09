@@ -1,52 +1,33 @@
-import math
 import os
+import random
 from pathlib import Path
 
+import numpy as np
 import pytorch3d
 import torch
-import random
 import torch.nn.functional as F
-from omegaconf import OmegaConf
-from PIL import Image as PilImage 
-import numpy as np
-
+from PIL import Image as PilImage
 from pytorch3d.io import load_objs_as_meshes, load_ply
 from pytorch3d.ops import sample_points_from_meshes
-
-from mvdream.ldm.util import instantiate_from_config
-from mvdream.ldm.interface import LatentDiffusionInterface
-from mvdream.camera_utils import get_camera
-from mvdream.model_zoo import build_model
-from lora import add_lora_to_cross_att_only, add_lora_to_attention_and_conv, add_lora_to_all_layers, LoRAConv2d, LoRALinear
-from pointnet_encoder import read_from_plyfile, get_pointnet_features, PointFeatProjector, get_point_cloud_name, get_point_cloud_name_reg
-from view_renderer import PointRenderer, MeshRendererMVDream
 from tqdm import tqdm
-from tester import Tester3D
-import pandas as pd
-from tester import Tester3D
+
+from lora import add_lora_to_cross_att_only, add_lora_to_all_layers, LoRALinear
+from mvdream.camera_utils import get_camera
 from mvdream.ldm.models.diffusion.ddim import DDIMSampler
-from pc_encoder import PointCloudEncoder
+from mvdream.model_zoo import build_model
+from pc_encoder import PointCloudEncoder, PointCloudTransformer
+from pointnet_encoder import read_from_plyfile, get_pointnet_features, PointFeatProjector, get_point_cloud_name_reg
+from view_renderer import PointRenderer, MeshRendererMVDream
 
 working_dir = os.path.dirname(os.path.abspath(__file__))
 
 from yanx_pointnet2_encoder import YanxPointNet2Encoder
-from tester import Tester3D
+from tester import Tester3D, get_mesh_from_pc
 from flow_matching import FlowMatching
 
 SNAP_DIR = f"{working_dir}/../../snap_gtr"
 OUTPUT_DIR = f"{working_dir}/../debug"
 MESH_DIR = f"{working_dir}/../debug_3D"
-
-gso_csv = f"{working_dir}/../../data/gso_label_to_mesh.csv"
-shapenet_csv = f"{working_dir}/../../data/shapenet_label_to_mesh.csv"
-mapping_gso = pd.read_csv(gso_csv)
-mapping_shapenet = pd.read_csv(shapenet_csv)
-
-
-def get_mesh_from_pc(pointcloud_name="bag1.ply"):
-    if pointcloud_name.startswith("shapenet"):
-        return mapping_shapenet.loc[mapping_shapenet["label"] == pointcloud_name, "filename"].iloc[0]
-    return mapping_gso.loc[mapping_gso["label"] == pointcloud_name, "filename"].iloc[0]
 
 def save_training_views_grid(imgs, out_path, pad=16):
     """
@@ -188,21 +169,23 @@ class LoRATrainer:
                 num_tokens=4,
         ).to(self.device)
 
-
         for p in projector.parameters():
             p.requires_grad_(True)
-        self.projector = projector
+        #self.projector = projector
 
         self.pc_encoder = PointCloudEncoder()
-        for p in self.pc_encoder.projector.parameters():
+
+        self.projector = PointCloudTransformer(n_layers=4)
+        for p in self.projector.parameters():
             p.requires_grad_(True)
 
         lora_param_list = list(self.lora_params)
         print(f"LoRA parameters: {sum(p.numel() for p in lora_param_list)/1e6:.2f}, LoRA Layers: {lora_layer_count}")
+        print(f"Projector parameters: {sum(p.numel() for p in self.projector.parameters())/1e6:.3f}")
 
         # Define optimizer
         #self.optimizer = torch.optim.AdamW( list(self.lora_params) + list(self.projector.parameters()) + list(self.depth_map_encoder.proj.parameters()), lr=1e-4,)
-        self.optimizer = torch.optim.AdamW( lora_param_list + list(self.projector.parameters()) + list(self.pc_encoder.projector.parameters()) , lr=1e-4,)
+        self.optimizer = torch.optim.AdamW( lora_param_list + list(self.projector.parameters()), lr=1e-4,)
 
         self.H = H
         self.W = W
@@ -215,7 +198,6 @@ class LoRATrainer:
         self.renderer = MeshRendererMVDream(device=self.device, image_size=self.H)
         #self.tester = Tester3D()
 
-        torch.manual_seed(42)
         self.ckpt_path = ckpt_path
         # check if depth_map_encoder already saved, else it will fail
         if load_from_ckpth:
@@ -225,13 +207,14 @@ class LoRATrainer:
             #self.depth_map_encoder.load_state_dict(ckpt["depth_map_encoder"], strict=False)
 
         self.pytorch3d_io = pytorch3d.io.IO()
+        self.projector = torch.compile(self.projector, dynamic=True, disable=False)
 
         if self.flow_matching:
             #add_lora_to_attention_and_conv(self.unet, r=lora_rank, alpha=lora_alpha)
             self.sampler = FlowMatching(self.device, self.model)
-            self.compiled_loss = torch.compile(self._compute_loss_flow_matching, dynamic=False, disable=True)
-            self.compiled_wrapper = torch.compile(self.training_wrapper, mode="max-autotune", dynamic=False,)
-            # TODO: Split compile in pc-encoding and mvdream finetuning
+            self.compiled_loss = self._compute_loss_flow_matching
+            self.compiled_wrapper = torch.compile(self.training_wrapper, mode="max-autotune", dynamic=False, disable=False)
+
             #self.compiled_loss = torch.compile(self._compute_loss_flow_matching, mode="max-autotune", dynamic=False,)
         else:
             self.sampler = DDIMSampler(self.model)
@@ -245,18 +228,25 @@ class LoRATrainer:
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             #print(f"Point cloud latent shape: {pc_latent.shape}", f"Target latent shape: {z.shape}")
-            pc_tokens = self.projector(pc_feat_flat)
+            with torch.no_grad():
+                #utonia_features = self.pc_encoder(coords=pc["points"], normals=pc["normals"], batch_lengths=pc["batch_lengths"])
+                utonia_features, batch_index = self.pc_encoder(coords=pc["points"], batch_idx=pc["batch_idx"])
+
+            cameras = camera_flat.view(camera_flat.shape[0] // 4, 4, -1)
+            pc_tokens, pc_latent = self.projector(utonia_features, cameras, batch_index)
+
             if random.random() < 0.1:
                 pc_tokens = torch.zeros_like(pc_tokens)
 
             context = torch.cat([pc_tokens], dim=1)
             cond = {"context": context, "camera": camera_flat, "num_frames": V}
+
             if self.start_from_noise:
-                loss = self.sampler.training_losses(x1=z, x0=None, cond=cond, t=t)
+                #loss = self.sampler.training_losses(x1=z, x0=None, cond=cond, t=t)
+                loss = self.compiled_wrapper(x1=z, x0=None, cond=cond, t=t)
             else:
-                pc_latent = self.pc_encoder(coords=pc["points"], normals=pc["normals"], batch_lengths=pc["batch_lengths"])
                 # add some noise to make it more random and as regularization
-                noise = torch.randn_like(pc_latent) * 0.15
+                noise = torch.randn_like(pc_latent) * 0.2
 
                 #loss = self.sampler.training_losses(x1=z, x0=pc_latent + noise, cond=cond, t=t)
                 loss = self.compiled_wrapper(x1=z, x0=pc_latent + noise, cond=cond, t=t)
@@ -344,8 +334,9 @@ class LoRATrainer:
             {
             "unet": self.unet.state_dict(),
             "projector": self.projector.state_dict(),
-            "pc_encoder" : self.pc_encoder.state_dict()
+            #"pc_encoder" : self.pc_encoder.state_dict(),
             }, ckpt_path)
+
         print("Saved", ckpt_path)
 
     @torch.no_grad()
@@ -477,7 +468,6 @@ class LoRATrainer:
         """
         self.model.train()
         self.projector.train()
-        self.pc_encoder.train()
 
         #V = int(item.get("V", self.num_views))
 
@@ -492,10 +482,6 @@ class LoRATrainer:
         c_text = item["c_text"].to(self.device).contiguous()
 
         B, V, C_lat, H_lat, W_lat = z.shape
-
-        point_list = []
-        normal_list = []
-        lengths = []
 
         # --- Vectorized Augmentation ---
         B_pts, N_pool, _ = points.shape
@@ -513,13 +499,14 @@ class LoRATrainer:
         flat_normals = normals[combined_mask]
 
         # Calculate lengths per batch element without a loop
-        lengths = combined_mask.sum(dim=1).cpu().tolist()
-
+        lengths = combined_mask.sum(dim=1)
+        batch_idx = torch.repeat_interleave(torch.arange(B_pts, device=lengths.device), lengths)
+        #batch_idx = torch.cumsum(lengths, dim=0)
 
         point_clouds = {
             "points": flat_points,
             "normals": flat_normals,
-            "batch_lengths": lengths
+            "batch_idx": batch_idx
         }
 
         # Flatten B and V for the UNet: (B*V, ...)

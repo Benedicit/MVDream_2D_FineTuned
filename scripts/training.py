@@ -1,30 +1,16 @@
-import math
 import os
-import random
-import torch
-import torch.nn.functional as F
-from lightning import seed_everything
-from torch.utils.tensorboard import SummaryWriter
-
-from torch.utils.data import Dataset, DataLoader
-
-from omegaconf import OmegaConf
-from PIL import Image as PilImage 
-import numpy as np
-
-from mvdream.ldm.util import instantiate_from_config
-from mvdream.ldm.interface import LatentDiffusionInterface
-from mvdream.camera_utils import get_camera
-from mvdream.model_zoo import build_model
-from lora import add_lora_to_cross_att_only, LoRALinear
-from pointnet_encoder import read_from_plyfile, get_pointnet_features, PointFeatProjector, get_point_cloud_name_reg
-from view_renderer import PointRenderer
-from tqdm import tqdm
-from trainer import LoRATrainer, get_mesh_from_pc
-from tester import Tester3D
 import warnings
 
+import torch
+from lightning import seed_everything
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+from trainer import LoRATrainer
+
 warnings.filterwarnings("ignore", category=FutureWarning)
+#torch._dynamo.config.capture_scalar_outputs = True
 
 working_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -40,7 +26,7 @@ class CacheDataset(Dataset):
         s = self.samples[idx]
         item = self.cache[s]
         # Return tensors directly for DataLoader collation
-        
+
         return {
             "z": item["z"],
             "pc_path": item["pc_path"],
@@ -59,7 +45,7 @@ def train_all_interleaved():
     base_path_masked = f"{working_dir}/../../data/dataset_masked/"
     train_samples = []
     
-    num_samples = 1280
+    num_samples = 576
     class_names = [#"airplane",
                    #"bag",
                    #"basket",
@@ -142,7 +128,7 @@ def train_all_interleaved():
         ELEV_DEG=15.0,
         DIST=2.5,
         flow_matching=True,
-        start_from_noise=False,
+        start_from_noise=True,
         load_from_ckpth=False,
         #ckpt_path="checkpoints/mvdream_lora_pc_128_classes_chair_interleaved.pt"
     )
@@ -165,8 +151,7 @@ def train_all_interleaved():
     '''
 
     # Save some memory by removing pointnet++
-    trainer.pointnet = None
-    num_epochs = 500
+    num_epochs = 650
 
     val_every = 200                 # validate every N optimizer steps
     val_steps = 30                  # ODE steps during validation inference
@@ -216,7 +201,7 @@ def train_all_interleaved():
             pbar.update(1)
             global_step += 1
 
-    trainer.save_weights(f"checkpoints/shapedream_{suffix}_latent_{len(class_names)}_classes_{num_samples}.pt")
+    trainer.save_weights(f"checkpoints/shapedream_{suffix}_utonia_{len(class_names)}_classes_{num_samples}_longer.pt")
     writer.close()
 
 
