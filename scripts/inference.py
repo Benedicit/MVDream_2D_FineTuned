@@ -11,30 +11,20 @@ from trainer import make_gt_of_sample_list
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning)
-torch._dynamo.config.capture_scalar_outputs = True
 
 working_dir = os.path.dirname(os.path.abspath(__file__))
 print(working_dir)
 SNAP_DIR = f"{working_dir}/../../snap_gtr"
 OUTPUT_DIR = working_dir + "/../debug"
 MESH_DIR = working_dir + "/../debug_3D"
-print(SNAP_DIR)
 
 base_path = f"{working_dir}/../../data/dataset_masked/"
-save_path = f"{working_dir}/debug/"
-
+save_path = f"{working_dir}/debug2/"
 
 def test_samples(tester: Tester3D, test_samples):
-    # load from specific checkpoint
-    # first need to load model such that we can sample properly
 
     os.makedirs("samples", exist_ok=True)
 
-    tester.load_model_for_pc(
-        pointcloud_path=base_path + test_samples[0],
-        lora_rank=64,
-        flow_matching=True
-    )
     #make_gt_of_sample_list(tester, test_samples, save_grid=True, save_4_views=False, generate_3D=False)
 
     for sample in test_samples:
@@ -43,12 +33,12 @@ def test_samples(tester: Tester3D, test_samples):
         full_name = get_point_cloud_name_reg(sample, with_number=True)
 
         imgs_pc = tester.sample_multiview(
-            steps=50,
+            steps=30,
             pointcloud_path=base_path + sample,
             prompt=f"a {prompt}",
             use_pointcloud=True,
             start_from_noise=True,
-            #scale=10.0
+            save_pc_renders=False,
         )
         #tester.save_view_grid(imgs_pc,  f"samples/{full_name}_samples.png")
 
@@ -57,11 +47,15 @@ def test_samples(tester: Tester3D, test_samples):
         
         tester.save_4_views(imgs_pc, out_dir=obj_path)
         
-        tester.views_to_3D(obj_path)
+        tester.images_to_3D(obj_path, refine_texture=False)
 
 if __name__ == "__main__":
+    working_dir = str(Path(__file__).parent.parent.parent.absolute()) + "/mvdream_2D/scripts"
     seed_everything(42)
-    tester = Tester3D(ckpt_path="checkpoints/shapedream_flowmatching_utonia_1_classes_560.pt")
+    tester = Tester3D(ckpt_path=f"{working_dir}/checkpoints/shapedream_flowmatching_utonia_1_classes_2000_2l.pt",
+                      lora_rank=64,
+                      flow_matching=True,
+                      )
     torch.set_float32_matmul_precision('high')
     '''
     train_samples = [
@@ -85,7 +79,7 @@ if __name__ == "__main__":
     classes = ["bench", "chair", "car", "table"]
     classes = ["chair"]
     for cl in classes:
-        for i in range(4000, 4050):
+        for i in range(4250, 4500):
             train_samples.append(f"shapenet_chair{i}.ply")
             #train_samples.append(f"shapenet_chair1513.ply")
     test_samples(tester, train_samples)

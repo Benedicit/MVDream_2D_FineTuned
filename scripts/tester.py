@@ -2,6 +2,20 @@ import os
 import random
 import sys
 from pathlib import Path
+from torch_geometric.utils import to_dense_batch
+from torchvision import transforms
+working_dir = str(Path(__file__).parent.parent.parent.absolute())
+
+SNAP_DIR = f"{working_dir}/snap_gtr"
+OUTPUT_DIR = working_dir + "/mvdream_2D/debug"
+MESH_DIR = working_dir + "/mvdream_2D/debug_3D"
+SHAPEDREAM_DIR = f"{working_dir}"
+MVDREAM_DIR = f"{working_dir}/mvdream_2D/scripts"
+
+sys.path.insert(0, working_dir)
+
+if SNAP_DIR not in sys.path:
+    sys.path.insert(0, str(SNAP_DIR))
 
 import pytorch3d
 import torch
@@ -9,28 +23,22 @@ from PIL import Image, ImageOps
 from pytorch3d.io import load_objs_as_meshes
 from pytorch3d.ops import sample_points_from_meshes
 from rembg import new_session, remove
+from loguru import logger
+from torch import GradScaler
 
 from flow_matching import FlowMatching
 from lora import add_lora_to_cross_att_only, add_lora_to_all_layers
 from mvdream.camera_utils import get_camera, create_camera_to_world_matrix
 from mvdream.ldm.models.diffusion.ddim import DDIMSampler
 from mvdream.model_zoo import build_model
-from pc_encoder import PointCloudTransformer
-from pointnet_encoder import get_pointnet_features, PointFeatProjector, read_from_plyfile
+from pc_encoder import PointCloudTransformer, PointCloudTransformerSmall
+from pointnet_encoder import get_pointnet_features, PointFeatProjector, read_from_plyfile, get_point_cloud_name_reg
+from snap_gtr.builders.build_system import build_system
+from snap_gtr.scripts.inference import load_eval_data
+from snap_gtr.utils.io_utils import read_yaml, EasyDict
+from snap_gtr.utils.render_utils import get_cameras, np_fov_to_intrinsic, invert_transform
+from snap_gtr.engine.optimizers import Optimizers
 from yanx_pointnet2_encoder import YanxPointNet2Encoder
-
-working_dir = str(Path(__file__).parent.parent.parent.absolute())
-print(working_dir)
-SNAP_DIR = f"{working_dir}/snap_gtr"
-OUTPUT_DIR = working_dir + "/mvdream_2D/debug"
-MESH_DIR = working_dir + "/mvdream_2D/debug_3D"
-SHAPEDREAM_DIR = f"{working_dir}"
-print(SNAP_DIR)
-sys.path.insert(0, SHAPEDREAM_DIR)
-if SNAP_DIR not in sys.path:
-    sys.path.insert(0, str(SNAP_DIR))
-
-from snap_gtr.scripts import inference
 
 from view_renderer import PointRenderer
 import math
@@ -54,9 +62,18 @@ def get_mesh_from_pc(pointcloud_name="bag1.ply"):
     return mapping_gso.loc[mapping_gso["label"] == pointcloud_name, "filename"].iloc[0]
 
 class Tester3D:
-    def __init__(self, ckpt_path = "checkpoints/mvdream_lora_pc_shoes_multiview.pt", ELEV_DEG=15.0, AZIM_START=0.0, AZIM_SPAN=360.0):
+    def __init__(self,
+                 ckpt_path,
+                 ELEV_DEG=15.0,
+                 AZIM_START=0.0,
+                 AZIM_SPAN=360.0,
+                 model="sd-v2.1-base-4view",
+                 flow_matching= True,
+                 lora_rank=32,
+                 alpha=8.0
+                 ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
+
         self.ckpt_path = ckpt_path
         self.ELEV_DEG = ELEV_DEG
         self.AZIM_START = AZIM_START
@@ -70,11 +87,32 @@ class Tester3D:
         )
         self.pytorch3d_io = pytorch3d.io.IO()
 
-        self.birefnet = AutoModelForImageSegmentation.from_pretrained('ZhengPeng7/BiRefNet', trust_remote_code=True).to(self.device)
+        self.birefnet = AutoModelForImageSegmentation.from_pretrained('zhengpeng7/BiRefNet', trust_remote_code=True).to(self.device)
         self.birefnet.eval()
-        #self.birefnet.half()
-    def load_model_for_pc(self, pointcloud_path, model="sd-v2.1-base-4view", flow_matching=False, lora_rank=32, alpha=8.0):
-        
+        self.birefnet.half()
+
+        # SnapGTR config
+        self.snap_gtr_config_path = f"{SNAP_DIR}/configs/config_texrefine.yaml"
+        job_description = read_yaml(self.snap_gtr_config_path)
+        self.config = job_description["jobs"][0]
+        self.config = EasyDict(self.config)
+
+        ckpt_path = f"{SNAP_DIR}/ckpts/full_checkpoint.pth"
+        self.snap_state_dict = torch.load(ckpt_path, weights_only=False, map_location="cpu")
+        if self.snap_state_dict is None:
+            raise ValueError(f"Failed to load checkpoint from {ckpt_path}")
+        self.snap_model = build_system(self.config, device=self.device, world_size=1)
+        self.snap_model.load_state_dict(self.snap_state_dict['pipeline'], strict=True)
+        self.snap_model.switch_eval()
+
+
+        self.param_groups = self.snap_model.get_param_groups()
+        self.snap_optimizers = Optimizers(self.config["optimizers"], self.param_groups)
+
+        self.snap_grad_scaler = GradScaler(enabled=True, init_scale=2048)
+        self.snap_grad_scaler.load_state_dict(self.snap_state_dict["scalers"])
+
+
         self.model = build_model(model)
         self.model.to(self.device)
         self.model.device = self.device
@@ -85,22 +123,9 @@ class Tester3D:
         else:
             add_lora_to_cross_att_only(self.unet, r=lora_rank, alpha=alpha)
 
-        dummy_c = self.model.get_learned_conditioning(["dummy"]).to(self.device)
-        context_dim = dummy_c.shape[-1]
+        #self.projector = PointCloudTransformer(n_layers=2)
+        self.projector = PointCloudTransformerSmall(n_self_attn_layers=2, num_tokens=4)
 
-
-        with torch.no_grad():
-            pc_feat_dummy = get_pointnet_features(self.pointnet, pointcloud_path=pointcloud_path, device=self.device)
-        pc_feat_dim = pc_feat_dummy.shape[-1]
-
-        #self.depth_map_encoder = DepthViTTokenEncoder(token_dim=context_dim, tokens_per_view=1, num_views=4).to(
-            #self.device)
-        projector = PointFeatProjector(
-        in_dim=pc_feat_dim,
-        context_dim=context_dim,
-        num_tokens=4,
-        ).to(self.device)
-        self.projector = PointCloudTransformer()
         self.encoder = PointCloudEncoder()
 
         # load module
@@ -122,21 +147,17 @@ class Tester3D:
             self.sampler = DDIMSampler(self.model)
 
 
-    def get_renderings_verts_from_file_pc(self, pointcloud_path=None):
+    def get_renderer(self, ):
         """
         pointcloud_path: Path to pointcloud
         """
-        # Get full pointcloud to train against
-        points_obj = read_from_plyfile(pointcloud_path)
-        verts = torch.tensor(points_obj, dtype=torch.float32, device=self.device)[:, :3]
-
         renderer = PointRenderer(device=self.device, image_size=256, radius=0.015)
 
-        return renderer, verts
+        return renderer
 
     @torch.no_grad()
     def sample_multiview(
-        self, 
+        self,
         pointcloud_path: str,
         prompt: str = "an object",
         use_pointcloud: bool = True,
@@ -147,6 +168,7 @@ class Tester3D:
         scale: float = 7.5,
         seed: int = 42,
         start_from_noise=True,
+        save_pc_renders=False,
 
     ):
         """
@@ -163,12 +185,12 @@ class Tester3D:
         pc_file = Path(pointcloud_path).name
         mesh_path = get_mesh_from_pc(pc_file)
         mesh = load_objs_as_meshes([mesh_path], device=self.device)
-        points, normals = sample_points_from_meshes(mesh, num_samples=8124, return_normals=True)
+        points, normals = sample_points_from_meshes(mesh, num_samples=8192, return_normals=True)
 
         # --- Vectorized Augmentation ---
         B_pts, N_pool, _ = points.shape
         split_axis = 0 if random.random() < 0.5 else 2
-        offset = random.random() * 0.015 - 0.01
+        offset = random.random() * 0.015
         percentage_kept = 0.75
 
         # Compute masks for the whole batch at once
@@ -180,19 +202,15 @@ class Tester3D:
         flat_points = points[combined_mask]
         flat_normals = normals[combined_mask]
 
-        # Calculate lengths per batch element without a loop
-        lengths = combined_mask.sum(dim=1)
-        batch_idx = torch.repeat_interleave(torch.arange(B_pts, device=lengths.device), lengths)
-        print(flat_points.shape, flat_normals.shape, batch_idx.shape)
 
         pc = {
             "points": flat_points,
             "normals": flat_normals,
-            "batch_idx": batch_idx
         }
         self.encoder.B = B_pts
 
-        utonia_features, batch_idx = self.encoder(coords=pc["points"], batch_idx=pc["batch_idx"])
+        utonia_features, batch_idx = self.encoder(coords=pc["points"])
+        pc_feat, mask = to_dense_batch(utonia_features, batch_idx)
 
 
         self.camera = get_camera(
@@ -203,9 +221,19 @@ class Tester3D:
             blender_coord=False,
         ).to(self.device)
 
+        if save_pc_renders:
+            full_name = get_point_cloud_name_reg(pointcloud_path, with_number=True)
+            pc_renderer = self.get_renderer()
+            pc_imgs = pc_renderer.render_mvdream_views(flat_points, camera=self.camera)
+            imgs_np = (0.5 * (pc_imgs + 1.0)).clamp(0,1)
+            imgs_np = (imgs_np.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
+            self.save_view_grid(
+                images_np=imgs_np,
+                out_path=f"samples/{full_name}_pc.png",
+            )
+
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            cameras = self.camera
-            pc_tokens, pc_latent = self.projector(utonia_features, cameras, batch_idx)  # [V,K,C]
+            pc_tokens, pc_latent = self.projector(pc_feat, mask, self.camera.unsqueeze(0))  # [V,K,C]
         if use_pointcloud:
 
             #cond_context = torch.cat([c_text, pc_tokens], dim=1)                   # [V,L+K,C]
@@ -230,13 +258,8 @@ class Tester3D:
             "num_frames": num_views,
         }
         if self.flow_matching:
-            pc_renderer, verts_pc = self.get_renderings_verts_from_file_pc(pointcloud_path)
             if start_from_noise:
-                pc_imgs = pc_renderer.render_mvdream_views(verts_pc, camera=self.camera).to(self.device)
-                x_source = self.model.encode_first_stage(pc_imgs)
-                if hasattr(self.model, "get_first_stage_encoding"):
-                    x_source = self.model.get_first_stage_encoding(x_source)
-                x_source = torch.randn_like(x_source)
+                x_source = torch.randn(latent_shape, device=self.device)
             else:
                 noise = torch.randn_like(pc_latent) * 0.15
                 x_source = pc_latent + noise
@@ -287,85 +310,93 @@ class Tester3D:
         Image.fromarray(canvas).save(out_path)
         print("Saved", out_path)
 
-    def views_to_3D(self, object_path):
-        #output_dir = OUTPUT_DIR + "/" + object_name
+    def images_to_3D(self, object_path, render_mesh_res=512, render_nerf_res=1024, refine_texture=False):
+
         out_dir = Path(object_path)
         in_dir  = Path(object_path)
-        inference.main(
-            args=[
-                "--ckpt_path", str(Path(SNAP_DIR) / "ckpts/full_checkpoint.pth"),
-                "--in_dir",    str(in_dir),
-                "--out_dir",   str(out_dir),
-            ],
-            standalone_mode=False,
+
+        # load data
+        data_batch = load_eval_data(in_dir)
+
+
+        for key, value in data_batch.items():
+            if type(value) is torch.Tensor:
+                data_batch[key] = value.unsqueeze(0).cuda(self.device, non_blocking=True)
+
+
+        # set up cameras for mesh rendering
+        num_frames, fov_deg, cam_distance = 50, 50, 3.5
+        azimuth_deg = torch.from_numpy(np.linspace(0, 360, num=num_frames, endpoint=False, dtype=np.float32))
+        elevation_deg = ([20] * num_frames)
+        elevation_deg = torch.tensor(elevation_deg).float()
+
+        cameras_render = get_cameras(
+            azimuth_deg,
+            elevation_deg,
+            width=render_mesh_res,
+            height=render_mesh_res,
+            fov=fov_deg,
+            camera_distance=cam_distance,
         )
-        gifs = [f for f in in_dir.iterdir() if f.suffix.lower() == ".gif"]
-        for gif in gifs:
-            Path(gif).unlink()
 
-    def remove_bg_with_rembg(self, rgb_u8: np.ndarray, border_size=32) -> np.ndarray:
-        img = Image.fromarray(rgb_u8, "RGB")
-        padded = ImageOps.expand(img, border=border_size, fill="white")
-        fg = remove(padded, session=self.rembg_session)  # returns RGBA
-        w, h = fg.size
-        fg = fg.crop((border_size, border_size, w - border_size, h - border_size))
-        return np.array(fg, dtype=np.uint8)  # (H,W,4)
-    
+        # set up cameras for NeRF rendering
+        K = np_fov_to_intrinsic(fov_deg, render_nerf_res, render_nerf_res)
+        camera_intrinsics = np.array([K[0, 0], K[1, 1], K[0, 2], K[1, 2]], dtype=np.float32)
+        camera_intrinsics = torch.from_numpy(camera_intrinsics).to(self.device).unsqueeze(0).expand(num_frames, -1)
 
-    def alpha_from_corner_key(self, rgb_u8: np.ndarray, pad=16, thresh=0.10) -> np.ndarray:
-        """
-        Estimate background color from corners and threshold RGB distance.
-        thresh ~ 0.06..0.15 usually works for white backgrounds.
-        Returns uint8 alpha in {0,255}.
-        """
-        rgb = rgb_u8.astype(np.float32) / 255.0
-        H, W, _ = rgb.shape
+        trans_cv2blender = torch.eye(4)
+        trans_cv2blender[1, 1] = -1
+        trans_cv2blender[2, 2] = -1
+        trans_blender2cv = trans_cv2blender.T
+        w2blender_cam = cameras_render['w2c']
+        w2cv_cam = trans_blender2cv[None] @ w2blender_cam
+        camera_poses = invert_transform(w2cv_cam)
 
-        corners = np.concatenate([
-            rgb[:pad, :pad].reshape(-1, 3),
-            rgb[:pad, -pad:].reshape(-1, 3),
-            rgb[-pad:, :pad].reshape(-1, 3),
-            rgb[-pad:, -pad:].reshape(-1, 3),
-        ], axis=0)
-        bg = np.median(corners, axis=0)
+        data_batch["poses"] = camera_poses
+        data_batch["intrinsics"] = camera_intrinsics
+        data_batch["imgs"] = torch.zeros((num_frames, render_nerf_res, render_nerf_res, 3), dtype=torch.float32)
+        data_batch["depths"] = torch.zeros((num_frames, render_nerf_res, render_nerf_res, 1), dtype=torch.float32)
+        data_batch["mvps"] = (cameras_render['mvp_mtx'])
+        data_batch["m2vs"] = (cameras_render['w2c'])
+        Path(out_dir).mkdir(exist_ok=True, parents=True)
+        if refine_texture:
+            self.snap_model.load_state_dict(self.snap_state_dict['pipeline'], strict=True)
+            code, loss = self.snap_model.refine_texture(data_batch, self.snap_optimizers, self.snap_grad_scaler, iters=50, learn_code=True)
+            logger.info(f"Refine texture done, Final loss: {loss}")
+        else:
+            code = None
 
-        dist = np.linalg.norm(rgb - bg[None, None, :], axis=-1)
-        a = (dist > thresh).astype(np.uint8) * 255
-        return a
+        # Mesh Gen
+        logger.info(f'Save to {out_dir}')
+        mesh_file = f"{out_dir}/mesh.obj"
+        logger.info(f"Provide code to extract mesh")
+        mesh_list = self.snap_model.extract_geometry(data_batch, resolution=512, level=10, code=code)
+        logger.info(f"Extract mesh")
+        mesh_list[0].export(mesh_file)
 
     @torch.no_grad()
-    def remove_bg_with_birefnet(self, rgb_u8: np.ndarray) -> np.ndarray:
+    def remove_bg_with_birefnet(self, rgb_u8: np.ndarray) -> Image.Image:
         # BiRefNet works best on 1024x1024 inputs
         H, W, _ = rgb_u8.shape
         img_input = Image.fromarray(rgb_u8)
-        img_resized = img_input.resize((1024, 1024), Image.BILINEAR)
 
-        img_tensor = torch.from_numpy(np.array(img_resized)).permute(2, 0, 1).float() / 255.0
-        img_tensor = img_tensor.unsqueeze(0).to(self.device)
+        image_size = (1024, 1024)
 
-        mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
-        img_tensor = (img_tensor - mean) / std
+        transform_image = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
 
-        pred = self.birefnet(img_tensor)
-        if isinstance(pred, (list, tuple)):
-            pred = pred[0]
+        transformed_input = transform_image(img_input).unsqueeze(0).to('cuda').half()
+        preds = self.birefnet(transformed_input)[-1].sigmoid().cpu()
+        pred = preds[0].squeeze()
+        pred_pil = transforms.ToPILImage()(pred)
 
-        # BiRefNet returns logits, use sigmoid to get mask
-        pred = torch.sigmoid(pred)
-        mask = pred[0, 0].cpu().numpy()
+        mask = pred_pil.resize(img_input.size)
+        img_input.putalpha(mask)
 
-        # Resize mask back to original size
-        mask_img = Image.fromarray((mask * 255).astype(np.uint8)).resize((W, H), Image.BILINEAR)
-        alpha_u8 = np.array(mask_img)
-
-        # Refine mask: anything very low becomes 0, anything very high becomes 255
-        # This helps preventing the "semi-transparent" look that deletes object parts
-        alpha_u8[alpha_u8 < 15] = 0
-        alpha_u8[alpha_u8 > 240] = 255
-
-        rgba = np.dstack([rgb_u8, alpha_u8]).astype(np.uint8)
-        return rgba
+        return img_input
 
     def save_4_views(self, images_np, out_dir: str, dist=2.5, fov_deg=50.0):
         out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
@@ -374,9 +405,9 @@ class Tester3D:
 
         for i in range(V):
             rgb = images_np[i].astype(np.uint8)
-            
-            rgba = self.remove_bg_with_birefnet(rgb)
-            Image.fromarray(rgba, "RGBA").save(out_dir / f"rgb_{i:03d}.png")
+
+            masked_image = self.remove_bg_with_birefnet(rgb)
+            masked_image.save(out_dir / f"rgb_{i:03d}.png")
 
 
         self.write_snapgtr_cameras_from_angles(
@@ -387,6 +418,7 @@ class Tester3D:
             radius=dist,
         )
 
+    # Note: The following private functions are from SnapGTR
     def _fov_to_intrinsic(self, fov_degree, width, height):
         fov_radian = math.radians(fov_degree)
         f = width / (2.0 * math.tan(fov_radian / 2.0))
