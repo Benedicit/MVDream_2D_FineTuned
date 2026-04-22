@@ -22,7 +22,6 @@ import torch
 from PIL import Image, ImageOps
 from pytorch3d.io import load_objs_as_meshes
 from pytorch3d.ops import sample_points_from_meshes
-from rembg import new_session, remove
 from loguru import logger
 from torch import GradScaler
 
@@ -31,7 +30,7 @@ from lora import add_lora_to_cross_att_only, add_lora_to_all_layers
 from mvdream.camera_utils import get_camera, create_camera_to_world_matrix
 from mvdream.ldm.models.diffusion.ddim import DDIMSampler
 from mvdream.model_zoo import build_model
-from pc_encoder import PointCloudTransformer, PointCloudTransformerSmall
+from pc_encoder import PointCloudTransformerSmall
 from pointnet_encoder import get_pointnet_features, PointFeatProjector, read_from_plyfile, get_point_cloud_name_reg
 from snap_gtr.builders.build_system import build_system
 from snap_gtr.scripts.inference import load_eval_data
@@ -53,13 +52,10 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 
 gso_csv = f"{script_dir}/../../data/gso_label_to_mesh.csv"
 shapenet_csv = f"{script_dir}/../../data/shapenet_label_to_mesh.csv"
-mapping_gso = pd.read_csv(gso_csv)
-mapping_shapenet = pd.read_csv(shapenet_csv)
+mapping_shapenet = pd.read_csv(shapenet_csv) if os.path.exists(shapenet_csv) else None
 
-def get_mesh_from_pc(pointcloud_name="bag1.ply"):
-    if pointcloud_name.startswith("shapenet"):
-        return mapping_shapenet.loc[mapping_shapenet["label"] == pointcloud_name, "filename"].iloc[0]
-    return mapping_gso.loc[mapping_gso["label"] == pointcloud_name, "filename"].iloc[0]
+def get_mesh_from_pc(pointcloud_name):
+    return mapping_shapenet.loc[mapping_shapenet["label"] == pointcloud_name, "filename"].iloc[0]
 
 class Tester3D:
     def __init__(self,
@@ -78,7 +74,6 @@ class Tester3D:
         self.ELEV_DEG = ELEV_DEG
         self.AZIM_START = AZIM_START
         self.AZIM_SPAN = AZIM_SPAN
-        self.rembg_session = new_session("u2net")
 
         self.pointnet = YanxPointNet2Encoder(
             normal_channel=False,

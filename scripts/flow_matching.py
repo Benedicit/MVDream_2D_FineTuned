@@ -228,9 +228,8 @@ class GVPSchedule(LinearSchedule):
 
 
 class FlowMatching(nn.Module):
-    def __init__(self, device,model,diffusion_parameterization: str = 'eps', diffusion_schedule: str = 'linear',):
+    def __init__(self, model,diffusion_parameterization: str = 'eps', diffusion_schedule: str = 'linear',):
         super().__init__()
-        self.device = device
         self.sigma_min = 0.0
         self.model = model
         self.schedule = LinearSchedule()
@@ -260,7 +259,7 @@ class FlowMatching(nn.Module):
         self.linear_end = linear_end
         assert alphas_cumprod.shape[0] == self.num_timesteps, 'alphas have to be defined for each timestep'
 
-        to_torch = partial(torch.tensor, dtype=torch.float32, device=self.device)
+        to_torch = partial(torch.tensor, dtype=torch.float32)
 
         self.register_buffer('betas', to_torch(betas))
         self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
@@ -349,7 +348,7 @@ class FlowMatching(nn.Module):
         Convert the continuous time t in [0,1] to discrete time t [0, 1000)
         # TODO: Make it compatible with zero-terminal SNR
         """
-        rectified_alphas_cumprod_full = self.rectified_alphas_cumprod_full.clone().to(t.device)
+        rectified_alphas_cumprod_full = self.rectified_alphas_cumprod_full.clone()
         # reverse the rectified_alphas_cumprod_full for searchsorted
         rectified_alphas_cumprod_full = torch.flip(rectified_alphas_cumprod_full, [0])
 
@@ -477,7 +476,7 @@ class FlowMatching(nn.Module):
 
         # timesteps
         num_steps = sample_kwargs.get("num_steps", 50)
-        t = torch.linspace(0, 1, num_steps, dtype=x.dtype).to(x.device)
+        t = torch.linspace(0, 1, num_steps, dtype=x.dtype)
         t = 1 - t if reverse else t
 
         # include classifier-free guidance
@@ -511,7 +510,7 @@ class FlowMatching(nn.Module):
 
             if method == "euler":
                 delta_t = 1 / num_steps
-                pred = x.clone().to(self.device)
+                pred = x.clone()
                 intermediates = [pred]
 
                 for i in tqdm(range(num_steps), disable=not sample_kwargs.get("progress", True), desc="ODE sampling"):
@@ -525,7 +524,7 @@ class FlowMatching(nn.Module):
                 results = [pred] if not return_intermediates else intermediates
 
             else:
-                t = torch.linspace(0, 1, num_steps + 1, dtype=x.dtype).to(x.device)
+                t = torch.linspace(0, 1, num_steps + 1, dtype=x.dtype, device=x.device)
                 t = 1 - t if reverse else t
                 results = odeint(
                     ode_fn,

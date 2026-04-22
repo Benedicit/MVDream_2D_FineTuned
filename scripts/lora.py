@@ -1,5 +1,7 @@
-# mvdream/ldm/modules/lora.py
-import torch
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent.absolute()))
+
 from torch import nn
 
 from typing import Iterable, Tuple
