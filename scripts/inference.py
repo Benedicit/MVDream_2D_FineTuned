@@ -4,9 +4,8 @@ from pathlib import Path
 import torch
 from lightning import seed_everything
 
-from tester import Tester3D
+from tester import Tester3D, make_gt_of_sample_list
 from pointnet_encoder import get_point_cloud_name, get_point_cloud_name_reg
-from trainer import make_gt_of_sample_list
 
 import warnings
 
@@ -52,7 +51,7 @@ def test_samples(tester: Tester3D, test_samples):
 if __name__ == "__main__":
     working_dir = str(Path(__file__).parent.parent.parent.absolute()) + "/mvdream_2D/scripts"
     seed_everything(42)
-    tester = Tester3D(ckpt_path=f"{working_dir}/checkpoints/shapedream_flowmatching_utonia_1_classes_2000_2l.pt",
+    tester = Tester3D(ckpt_path=f"{working_dir}/checkpoints/shapedream_flowmatching_utonia_1_classes_800_2l_dist.ckpt",
                       lora_rank=64,
                       flow_matching=True,
                       )

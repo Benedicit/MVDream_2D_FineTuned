@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from torch_geometric.utils import to_dense_batch
 from torchvision import transforms
+from tqdm import tqdm
+
 working_dir = str(Path(__file__).parent.parent.parent.absolute())
 
 SNAP_DIR = f"{working_dir}/snap_gtr"
@@ -19,7 +21,7 @@ if SNAP_DIR not in sys.path:
 
 import pytorch3d
 import torch
-from PIL import Image, ImageOps
+from PIL import Image
 from pytorch3d.io import load_objs_as_meshes
 from pytorch3d.ops import sample_points_from_meshes
 from loguru import logger
@@ -30,7 +32,6 @@ from lora import add_lora_to_cross_att_only, add_lora_to_all_layers
 from mvdream.camera_utils import get_camera, create_camera_to_world_matrix
 from mvdream.ldm.models.diffusion.ddim import DDIMSampler
 from mvdream.model_zoo import build_model
-from pc_encoder import PointCloudTransformerSmall
 from pointnet_encoder import get_pointnet_features, PointFeatProjector, read_from_plyfile, get_point_cloud_name_reg
 from snap_gtr.builders.build_system import build_system
 from snap_gtr.scripts.inference import load_eval_data
@@ -39,15 +40,17 @@ from snap_gtr.utils.render_utils import get_cameras, np_fov_to_intrinsic, invert
 from snap_gtr.engine.optimizers import Optimizers
 from yanx_pointnet2_encoder import YanxPointNet2Encoder
 
-from view_renderer import PointRenderer
+from view_renderer import PointRenderer, MeshRendererMVDream
 import math
 import numpy as np
 from pathlib import Path
 from transformers import AutoModelForImageSegmentation
 
-from pc_encoder import PointCloudEncoder
-
+from pc_encoder import PointCloudEncoder, PointCloudTransformerSmall
+from util import save_training_views_grid
 import pandas as pd
+from trainer import LoRATrainer
+
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 gso_csv = f"{script_dir}/../../data/gso_label_to_mesh.csv"
@@ -56,6 +59,9 @@ mapping_shapenet = pd.read_csv(shapenet_csv) if os.path.exists(shapenet_csv) els
 
 def get_mesh_from_pc(pointcloud_name):
     return mapping_shapenet.loc[mapping_shapenet["label"] == pointcloud_name, "filename"].iloc[0]
+
+
+
 
 class Tester3D:
     def __init__(self,
@@ -107,7 +113,7 @@ class Tester3D:
         self.snap_grad_scaler = GradScaler(enabled=True, init_scale=2048)
         self.snap_grad_scaler.load_state_dict(self.snap_state_dict["scalers"])
 
-
+        '''
         self.model = build_model(model)
         self.model.to(self.device)
         self.model.device = self.device
@@ -118,25 +124,37 @@ class Tester3D:
         else:
             add_lora_to_cross_att_only(self.unet, r=lora_rank, alpha=alpha)
 
-        #self.projector = PointCloudTransformer(n_layers=2)
         self.projector = PointCloudTransformerSmall(n_self_attn_layers=2, num_tokens=4)
 
+        
         self.encoder = PointCloudEncoder()
 
         # load module
         ckpt = torch.load(self.ckpt_path, map_location="cpu")
-        self.unet.load_state_dict(ckpt["unet"], strict=False)
+        self.model.load_state_dict(ckpt["model"], strict=False)
         self.projector.load_state_dict(ckpt["projector"], strict=True)
 
         self.model.device = self.device
         self.model.eval()
         self.projector.eval()
+        '''
+        self._module = LoRATrainer.load_from_checkpoint(
+            ckpt_path,
+            map_location=self.device,
+        )
+        self._module.to(self.device)
+        self._module.eval()
 
+        # --- Expose the same attributes Tester3D used before ---
+        self.model     = self._module.model
+        self.unet      = self._module.unet
+        self.projector = self._module.projector
+        self.encoder   = PointCloudEncoder().to(self.device)
 
         self.flow_matching = flow_matching
 
         if self.flow_matching:
-            self.sampler = FlowMatching(self.device, self.model)
+            self.sampler = FlowMatching(self.model)
             self.sampler.eval()
         else:
             self.sampler = DDIMSampler(self.model)
@@ -477,3 +495,45 @@ class Tester3D:
                 f.write("intrinsic fx, fy, cx, cy, height, width \n")
                 f.write(f"{K[0,0]:.6f} {K[1,1]:.6f} {K[0,2]:.6f} {K[1,2]:.6f} {H} {W}\n")
 
+def make_gt_of_sample_list(tester : Tester3D, samples, elev_deg=15.0, debug_dir: str = "ground_truth/", save_grid=False, save_4_views=True, generate_3D=False):
+    Path(debug_dir).mkdir(parents=True, exist_ok=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    V = 4
+    renderer = MeshRendererMVDream(device=device, image_size=256)
+    # get camera once
+    cam_gpu = get_camera(
+        num_frames=V,
+        elevation=elev_deg,
+        azimuth_start=0.0,
+        azimuth_span=360.0,
+        blender_coord=False,
+    ).to(device, non_blocking=True)
+    cam = cam_gpu.contiguous()
+
+    pbar = tqdm(total=len(samples), desc="Rendering GT meshes", unit="samples")
+    for sample in samples:
+        name = get_point_cloud_name_reg(sample, with_number=True)
+
+        mesh_path = get_mesh_from_pc(sample)
+
+        mesh = load_objs_as_meshes([mesh_path], device=device, load_textures=False)
+        verts_m = mesh.verts_packed()
+        faces_m = mesh.faces_packed()
+
+        x = renderer.render_mvdream_views(verts_m, faces_m, camera=cam)
+
+
+        if save_grid:
+            save_training_views_grid(
+                imgs=x,
+                out_path=os.path.join(debug_dir, f"{name}_target.png"),
+            )
+        elif save_4_views:
+            x = torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
+            target_imgs = (x * 255.0).permute(0, 2, 3, 1).cpu().numpy()
+            obj_path = debug_dir + name
+            tester.save_4_views(target_imgs,obj_path)
+            if generate_3D:
+                tester.images_to_3D(obj_path)
+        pbar.update(1)

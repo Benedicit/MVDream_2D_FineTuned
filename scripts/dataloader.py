@@ -30,6 +30,7 @@ from view_renderer import PointRenderer, MeshRendererMVDream
 working_dir = os.path.dirname(os.path.abspath(__file__))
 
 class CacheDataset(Dataset):
+    # TODO: Remove samples
     def __init__(self, cache, samples):
         self.cache = cache
         self.samples = samples
@@ -71,8 +72,7 @@ class ShapeDreamDataModule(L.LightningDataModule):
     def __init__(
             self,
             class_names: list[str],
-            # model params needed to build the cache
-            model_name: str = "sd-v2.1-base-4view",
+            model,
             num_views: int = 4,
             H: int = 256,
             ELEV_DEG: float = 15.0,
@@ -82,10 +82,10 @@ class ShapeDreamDataModule(L.LightningDataModule):
             num_samples: int = 4000,
             batch_size: int = 16,
             debug_dir: str = "debug/cache",
+            cache_dir: str = "cache",
     ):
         super().__init__()
         self.class_names = class_names
-        self.model_name = model_name
         self.num_views = num_views
         self.H = H
         self.ELEV_DEG = ELEV_DEG
@@ -94,9 +94,11 @@ class ShapeDreamDataModule(L.LightningDataModule):
         self.num_samples = num_samples
         self.batch_size = batch_size
         self.debug_dir = debug_dir
+        self.model = model
 
         self.train_cache = None
         self.val_cache = None
+        self.cache_dir = cache_dir
 
     def _build_sample_list(self, start: int, end: int) -> list[str]:
         samples = []
@@ -105,47 +107,73 @@ class ShapeDreamDataModule(L.LightningDataModule):
                 samples.append(f"shapenet_{cl}{a}.ply")
         return samples
 
-    def setup(self, stage: str = None):
-        device = torch.device(f"cuda:{self.trainer.local_rank}")
 
-        # Store as instance attributes so build_cache can access them via self
-        self._pc_encoder = PointCloudEncoder().to(device)
-        self._model      = build_model(model_name=self.model_name).to(device)
-        self._renderer   = MeshRendererMVDream(device=device, image_size=self.H)
-        self._camera     = get_camera(
+    def prepare_data(self):
+        """Called only on rank 0 — build and save cache to disk."""
+        # Don't assign to self here — prepare_data runs on rank 0 only
+        # so self assignments won't be visible on other ranks
+        device = torch.device("cuda:0")
+
+        pc_encoder = PointCloudEncoder().to(device)
+        renderer   = MeshRendererMVDream(device=device, image_size=self.H)
+        camera     = get_camera(
             num_frames=self.num_views,
             elevation=self.ELEV_DEG,
             azimuth_start=self.AZIM_START,
             azimuth_span=self.AZIM_SPAN,
             blender_coord=False,
         ).to(device)
-        self.device = device
+        model = self.model.to(device)
+        model.eval()
+
+        # Temporarily assign so build_cache can use them via self
+        self._pc_encoder = pc_encoder
+        self._renderer   = renderer
+        self._camera     = camera
+        self.device      = device
+
+        train_path = os.path.join(self.cache_dir, "train_cache.pt")
+        val_path   = os.path.join(self.cache_dir, "val_cache.pt")
+
+        os.makedirs(self.cache_dir, exist_ok=True)
+        train_samples = self._build_sample_list(1, self.num_samples + 1)
+        train_cache = self.build_cache(train_samples, f"{self.debug_dir}/train")
+        torch.save({"cache": train_cache, "samples": train_samples}, train_path)
+
+        if not os.path.exists(val_path):
+            num_val = int(self.num_samples * 0.1)
+            num_val += num_val % self.batch_size
+            num_val = max(self.batch_size, num_val)
+            val_start = self.num_samples + 50
+            val_samples = self._build_sample_list(val_start, val_start + num_val)
+            val_cache = self.build_cache(val_samples, f"{self.debug_dir}/val")
+            torch.save({"cache": val_cache, "samples": val_samples}, val_path)
+            print(f"[rank0] Val cache saved to {val_path}")
+        else:
+            print(f"[rank0] Val cache already exists, skipping.")
+
+        # Clean up
+        del self._pc_encoder, self._renderer, self._camera
+        torch.cuda.empty_cache()
+
+    def setup(self, stage: str = None):
+        """Called on every rank — just load from disk."""
+        train_path = os.path.join(self.cache_dir, "train_cache.pt")
+        val_path   = os.path.join(self.cache_dir, "val_cache.pt")
 
         if stage in ("fit", None):
-            train_samples = self._build_sample_list(1, self.num_samples + 1)
-            self.train_samples = train_samples
-            self.train_cache = self.build_cache(train_samples, f"{self.debug_dir}/train")
+            train_data = torch.load(train_path, map_location="cpu")
+            self.train_cache   = train_data["cache"]
+            self.train_samples = train_data["samples"]
 
-            num_val = int(self.num_samples * 0.1)
-            num_val += num_val % self.batch_size
-            num_val = max(self.batch_size, num_val)
-            val_start = self.num_samples + 50
-            val_samples = self._build_sample_list(val_start, val_start + num_val)
-            self.val_samples = val_samples
-            self.val_cache = self.build_cache(val_samples, f"{self.debug_dir}/val")
+            val_data = torch.load(val_path, map_location="cpu")
+            self.val_cache   = val_data["cache"]
+            self.val_samples = val_data["samples"]
 
         if stage == "validate":
-            num_val = int(self.num_samples * 0.1)
-            num_val += num_val % self.batch_size
-            num_val = max(self.batch_size, num_val)
-            val_start = self.num_samples + 50
-            val_samples = self._build_sample_list(val_start, val_start + num_val)
-            self.val_samples = val_samples
-            self.val_cache = self.build_cache(val_samples, f"{self.debug_dir}/val")
-
-        # Free temporary resources after caching is done
-        del self._pc_encoder, self._model, self._renderer, self._camera
-        torch.cuda.empty_cache()
+            val_data = torch.load(val_path, map_location="cpu")
+            self.val_cache   = val_data["cache"]
+            self.val_samples = val_data["samples"]
 
     @torch.no_grad()
     def build_cache(self, samples: list[str], debug_dir: str, save_target_imgs: bool = False, save_pc_imgs: bool = False) -> dict:
@@ -177,17 +205,15 @@ class ShapeDreamDataModule(L.LightningDataModule):
                 feat, _ = self._pc_encoder(flat_points)
                 cache.setdefault(sample, {})[key] = feat.squeeze(0).detach().cpu()
 
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                z = self._model.encode_first_stage(target_imgs)
-                if hasattr(self._model, "get_first_stage_encoding"):
-                    z = self._model.get_first_stage_encoding(z)
+            z = self.model.encode_first_stage(target_imgs)
+            if hasattr(self.model, "get_first_stage_encoding"):
+                z = self.model.get_first_stage_encoding(z)
             z = z.detach().contiguous()
 
             prompt = "a " + get_point_cloud_name_reg(sample)
             c1 = text_cond_cache.get(prompt)
             if c1 is None:
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    c1 = self._model.get_learned_conditioning([prompt])
+                c1 = self.model.get_learned_conditioning([prompt])
                 c1 = c1.detach().contiguous()
                 text_cond_cache[prompt] = c1
             c_text = c1.repeat(self.num_views, *([1] * (c1.dim() - 1))).contiguous()
@@ -201,12 +227,16 @@ class ShapeDreamDataModule(L.LightningDataModule):
         return cache
 
     def train_dataloader(self):
+
         return DataLoader(
             CacheDataset(self.train_cache, self.train_samples),
             batch_size=self.batch_size,
             shuffle=True,
             pin_memory=True,
             drop_last=True,
+            num_workers=4,
+            persistent_workers=True,
+            prefetch_factor=2,
             collate_fn=collate_pc_feat,
         )
 
@@ -217,6 +247,9 @@ class ShapeDreamDataModule(L.LightningDataModule):
             shuffle=False,
             pin_memory=True,
             drop_last=False,
+            num_workers=4,
+            persistent_workers=True,
+            prefetch_factor=2,
             collate_fn=collate_pc_feat,
         )
 

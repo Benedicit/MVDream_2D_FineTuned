@@ -1,21 +1,13 @@
 import os
-import random
-from pathlib import Path
 import sys
-
-from lightning.pytorch.utilities.types import OptimizerLRScheduler
 
 working_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, working_dir)
 
-import numpy as np
 import pytorch3d
 import torch
 import torch.nn.functional as F
-from PIL import Image as PilImage
 from pytorch3d.io import load_objs_as_meshes, load_ply
-from pytorch3d.ops import sample_points_from_meshes
-from tqdm import tqdm
 
 from lightning import LightningModule
 
@@ -23,80 +15,16 @@ from lora import add_lora_to_cross_att_only, add_lora_to_all_layers, LoRALinear
 from mvdream.camera_utils import get_camera
 from mvdream.ldm.models.diffusion.ddim import DDIMSampler
 from mvdream.model_zoo import build_model
-from pc_encoder import PointCloudEncoder, PointCloudTransformerSmall
-from pointnet_encoder import read_from_plyfile, get_pointnet_features, PointFeatProjector, get_point_cloud_name_reg
-from view_renderer import PointRenderer, MeshRendererMVDream
+from pc_encoder import PointCloudTransformerSmall
+from view_renderer import PointRenderer
 
-from tester import Tester3D, get_mesh_from_pc
 from flow_matching import FlowMatching
 
 SNAP_DIR = f"{working_dir}/../../snap_gtr"
 OUTPUT_DIR = f"{working_dir}/../debug"
 MESH_DIR = f"{working_dir}/../debug_3D"
 
-def save_training_views_grid(imgs, out_path, pad=16):
-    """
-    imgs: (V,3,H,W) in [-1,1]
-    """
-    imgs_np = (0.5 * (imgs + 1.0)).clamp(0,1)
-    imgs_np = (imgs_np.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
 
-    V, H, W, C = imgs_np.shape
-    canvas_h = H + 2 * pad
-    canvas_w = V * W + (V + 1) * pad
-    canvas = np.zeros((canvas_h, canvas_w, C), dtype=np.uint8)
-
-    y = pad
-    for i in range(V):
-        x = pad + i * (W + pad)
-        canvas[y:y + H, x:x + W, :] = imgs_np[i]
-
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    PilImage.fromarray(canvas).save(out_path)
-    print("Saved training views grid to", out_path)
-
-def make_gt_of_sample_list(tester : Tester3D, samples, elev_deg=15.0, debug_dir: str = "ground_truth/", save_grid=False, save_4_views=True, generate_3D=False):
-    Path(debug_dir).mkdir(parents=True, exist_ok=True)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    V = 4
-    renderer = MeshRendererMVDream(device=device, image_size=256)
-    # get camera once
-    cam_gpu = get_camera(
-        num_frames=V,
-        elevation=elev_deg,
-        azimuth_start=0.0,
-        azimuth_span=360.0,
-        blender_coord=False,
-    ).to(device, non_blocking=True)
-    cam = cam_gpu.contiguous()
-
-    pbar = tqdm(total=len(samples), desc="Rendering GT meshes", unit="samples")
-    for sample in samples:
-        name = get_point_cloud_name_reg(sample, with_number=True)
-
-        mesh_path = get_mesh_from_pc(sample)
-
-        mesh = load_objs_as_meshes([mesh_path], device=device, load_textures=False)
-        verts_m = mesh.verts_packed()
-        faces_m = mesh.faces_packed()
-
-        x = renderer.render_mvdream_views(verts_m, faces_m, camera=cam)
-
-
-        if save_grid:
-            save_training_views_grid(
-                imgs=x,
-                out_path=os.path.join(debug_dir, f"{name}_target.png"),
-            )
-        elif save_4_views:
-            x = torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
-            target_imgs = (x * 255.0).permute(0, 2, 3, 1).cpu().numpy()
-            obj_path = debug_dir + name
-            tester.save_4_views(target_imgs,obj_path)
-            if generate_3D:
-                tester.views_to_3D(obj_path)
-        pbar.update(1)
 
 class LoRATrainer(LightningModule):
     def __init__(self,
@@ -116,6 +44,7 @@ class LoRATrainer(LightningModule):
                  ckpt_path="",
                  no_compile=False):
         super().__init__()
+        self.save_hyperparameters()
         self.model = build_model(model_name=model_name)
 
         self.unet = self.model.model.diffusion_model
@@ -127,7 +56,7 @@ class LoRATrainer(LightningModule):
         else:
             add_lora_to_cross_att_only(self.unet, r=lora_rank, alpha=lora_alpha)
 
-        self.model.device = self.device
+        #self.model.device = self.device
 
         for p in self.model.parameters():
             p.requires_grad_(False)
@@ -148,6 +77,7 @@ class LoRATrainer(LightningModule):
 
 
         #self.pc_encoder = PointCloudEncoder()
+        self.no_compile = no_compile
 
         self.projector = PointCloudTransformerSmall(n_self_attn_layers=2, num_tokens=4)
         for p in self.projector.parameters():
@@ -165,38 +95,47 @@ class LoRATrainer(LightningModule):
         self.DIST = DIST
         self.num_views = num_views
 
-        self.camera = get_camera(
+        self.register_buffer("camera", get_camera(
             num_frames=num_views,
             elevation=self.ELEV_DEG,
             azimuth_start=self.AZIM_START,
             azimuth_span=self.AZIM_SPAN,
             blender_coord=False,
-        )
+        ))
 
         self.ckpt_path = ckpt_path
-        # check if depth_map_encoder already saved, else it will fail
-        if load_from_ckpth:
-            ckpt = torch.load(self.ckpt_path, map_location="cpu")
-            self.unet.load_state_dict(ckpt["unet"], strict=False)
-            self.projector.load_state_dict(ckpt["projector"], strict=True)
-            #self.depth_map_encoder.load_state_dict(ckpt["depth_map_encoder"], strict=False)
 
         self.pytorch3d_io = pytorch3d.io.IO()
-        self.projector_fwd = torch.compile(self.projector, dynamic=True, disable=no_compile)
+
+        self.compiled_wrapper = self.training_wrapper
 
         if self.flow_matching:
             #add_lora_to_attention_and_conv(self.unet, r=lora_rank, alpha=lora_alpha)
-            self.sampler = FlowMatching(self.device, self.model)
-            self.compiled_wrapper = torch.compile(self.training_wrapper, mode="max-autotune", dynamic=False, disable=no_compile)
+            self.sampler = FlowMatching(self.model)
+            #self.compiled_wrapper = torch.compile(self.training_wrapper, mode="max-autotune", dynamic=False, disable=no_compile)
         else:
             self.sampler = DDIMSampler(self.model)
 
-    def configure_optimizers(self) -> OptimizerLRScheduler:
+    def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.lora_param_list + list(self.projector.parameters()), lr=1e-4,)
         return optimizer
 
     def setup(self, stage: str):
-        pass
+        if hasattr(self, "_model_configured"):
+            return
+        print("Activating compilation")
+        self.projector = torch.compile(
+            self.projector,
+            dynamic=True,
+            disable=self.no_compile,
+        )
+        self.compiled_wrapper = torch.compile(
+            self.training_wrapper,
+            mode="max-autotune",
+            dynamic=False,
+            disable=self.no_compile,
+        )
+        self._model_configured = True
 
     def training_wrapper(self, x1, x0, cond, t):
         return self.sampler.training_losses(x1=x1, x0=x0, cond=cond, t=t)
@@ -232,22 +171,6 @@ class LoRATrainer(LightningModule):
         # Return renderer, verts, and faces (since the renderer now needs both)
         return verts, faces, mesh if mesh else None
 
-    def save_weights(self, ckpt_path="checkpoints/mvdream_lora_pc_bag1_multiview.pt"):
-        """
-        save the weights in specified file
-        self: Description
-        """
-        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-        #torch.save({"unet": self.unet.state_dict(), "projector": self.projector.state_dict(), "depth_map_encoder": self.depth_map_encoder.state_dict()}, ckpt_path)
-        torch.save(
-            {
-            "unet": self.unet.state_dict(),
-            "projector": self.projector.state_dict(),
-            #"pc_encoder" : self.pc_encoder.state_dict(),
-            }, ckpt_path)
-
-        print("Saved", ckpt_path)
-
     def training_step(self, batch, batch_idx):
         # Unpack batch (same logic as train_one_step_from_cache)
         z         = batch["z"].contiguous()
@@ -268,7 +191,7 @@ class LoRATrainer(LightningModule):
         pc_tokens, pc_latent = self.projector(pc_feat, pc_feat_mask, cameras)
 
         if torch.rand(1).item() < 0.1:
-            pc_tokens = torch.zeros_like(pc_tokens)
+            pc_tokens = pc_tokens * 0.0
 
         cond = {"context": pc_tokens, "camera": camera_flat, "num_frames": V}
 
@@ -319,7 +242,8 @@ class LoRATrainer(LightningModule):
         mse = F.mse_loss(z, samples)
         l1  = F.l1_loss(gen_pixels, gt_pixels)
 
-        self.log_dict({"val/mse": mse, "val/l1": l1}, prog_bar=True)
+        self.log("val/mse", mse, prog_bar=True)
+        self.log("val/l1", l1, prog_bar=True)
 
 
     @torch.no_grad()
