@@ -25,7 +25,6 @@ OUTPUT_DIR = f"{working_dir}/../debug"
 MESH_DIR = f"{working_dir}/../debug_3D"
 
 
-
 class LoRATrainer(LightningModule):
     def __init__(self,
                  lora_rank,
@@ -44,7 +43,6 @@ class LoRATrainer(LightningModule):
                  ckpt_path="",
                  no_compile=False):
         super().__init__()
-        self.save_hyperparameters()
         self.model = build_model(model_name=model_name)
 
         self.unet = self.model.model.diffusion_model
@@ -108,6 +106,7 @@ class LoRATrainer(LightningModule):
         self.pytorch3d_io = pytorch3d.io.IO()
 
         self.compiled_wrapper = self.training_wrapper
+        self.projector_fwd = self.projector.forward
 
         if self.flow_matching:
             #add_lora_to_attention_and_conv(self.unet, r=lora_rank, alpha=lora_alpha)
@@ -115,17 +114,18 @@ class LoRATrainer(LightningModule):
             #self.compiled_wrapper = torch.compile(self.training_wrapper, mode="max-autotune", dynamic=False, disable=no_compile)
         else:
             self.sampler = DDIMSampler(self.model)
+        self.save_hyperparameters()
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.lora_param_list + list(self.projector.parameters()), lr=1e-4,)
+        optimizer = torch.optim.AdamW(self.lora_param_list + list(self.projector.parameters()), lr=1.1e-4,)
         return optimizer
 
     def setup(self, stage: str):
         if hasattr(self, "_model_configured"):
             return
         print("Activating compilation")
-        self.projector = torch.compile(
-            self.projector,
+        self.projector_fwd = torch.compile(
+            self.projector.forward,
             dynamic=True,
             disable=self.no_compile,
         )
@@ -188,7 +188,7 @@ class LoRATrainer(LightningModule):
 
         cameras  = camera_flat.view(camera_flat.shape[0] // V, V, -1)
         #pc_tokens, pc_latent = self.projector_fwd(pc_feat, pc_feat_mask, cameras)
-        pc_tokens, pc_latent = self.projector(pc_feat, pc_feat_mask, cameras)
+        pc_tokens, pc_latent = self.projector_fwd(pc_feat, pc_feat_mask, cameras)
 
         if torch.rand(1).item() < 0.1:
             pc_tokens = pc_tokens * 0.0

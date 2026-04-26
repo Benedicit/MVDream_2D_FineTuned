@@ -19,12 +19,12 @@ import torch._dynamo
 torch._dynamo.config.optimize_ddp = False
 
 def train():
-    L.seed_everything(42)  # replaces seed_everything(42) from __main__
+    L.seed_everything(42)
     torch.set_float32_matmul_precision("medium")
 
-    num_samples = 800
+    num_samples = 2000
     batch_size = 16
-    num_epochs = 850
+    num_epochs = 1000
 
     class_names = [#"airplane",
                    #"bag",
@@ -123,7 +123,7 @@ def train():
         max_epochs=num_epochs,
         precision="bf16-mixed",
         accelerator="gpu",
-        devices=3,
+        devices="auto",
         logger=TensorBoardLogger(save_dir="logs", name="two_self_attn_long"),
         callbacks=[checkpoint_callback, TQDMProgressBar(refresh_rate=5)],
         log_every_n_steps=50,
@@ -145,5 +145,4 @@ def train():
 
 
 if __name__ == "__main__":
-    torch.set_float32_matmul_precision('medium')
     train()

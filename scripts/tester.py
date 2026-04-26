@@ -60,9 +60,6 @@ mapping_shapenet = pd.read_csv(shapenet_csv) if os.path.exists(shapenet_csv) els
 def get_mesh_from_pc(pointcloud_name):
     return mapping_shapenet.loc[mapping_shapenet["label"] == pointcloud_name, "filename"].iloc[0]
 
-
-
-
 class Tester3D:
     def __init__(self,
                  ckpt_path,
@@ -138,26 +135,32 @@ class Tester3D:
         self.model.eval()
         self.projector.eval()
         '''
-        self._module = LoRATrainer.load_from_checkpoint(
-            ckpt_path,
-            map_location=self.device,
+        ckpt = torch.load(self.ckpt_path, map_location=self.device)
+        state_dict = ckpt["state_dict"]
+        #state_dict = _remap_state_dict(ckpt["state_dict"])
+        self._module = LoRATrainer(
+            lora_rank=lora_rank,
+            lora_alpha=alpha,
+            flow_matching=flow_matching
         )
+        self._module.load_state_dict(state_dict, strict=True)
+
         self._module.to(self.device)
         self._module.eval()
 
         # --- Expose the same attributes Tester3D used before ---
-        self.model     = self._module.model
-        self.unet      = self._module.unet
-        self.projector = self._module.projector
+        self.model     = self._module.model.to(self.device)
+        self.unet      = self._module.unet.to(self.device)
+        self.projector = self._module.projector.to(self.device)
         self.encoder   = PointCloudEncoder().to(self.device)
 
         self.flow_matching = flow_matching
 
         if self.flow_matching:
-            self.sampler = FlowMatching(self.model)
+            self.sampler = FlowMatching(self.model).to(self.device)
             self.sampler.eval()
         else:
-            self.sampler = DDIMSampler(self.model)
+            self.sampler = DDIMSampler(self.model).to(self.device)
 
 
     def get_renderer(self, ):
@@ -212,8 +215,8 @@ class Tester3D:
         combined_mask = axis_mask & dropout_mask # [B, N]
 
         # Flatten to filter efficiently
-        flat_points = points[combined_mask]
-        flat_normals = normals[combined_mask]
+        flat_points = points[combined_mask].to(self.device)
+        flat_normals = normals[combined_mask].to(self.device)
 
 
         pc = {

@@ -109,9 +109,7 @@ class ShapeDreamDataModule(L.LightningDataModule):
 
 
     def prepare_data(self):
-        """Called only on rank 0 — build and save cache to disk."""
-        # Don't assign to self here — prepare_data runs on rank 0 only
-        # so self assignments won't be visible on other ranks
+        """Called only on rank 0"""
         device = torch.device("cuda:0")
 
         pc_encoder = PointCloudEncoder().to(device)
