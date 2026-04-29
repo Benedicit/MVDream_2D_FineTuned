@@ -24,7 +24,7 @@ from mvdream.model_zoo import build_model
 from mvdream.camera_utils import get_camera
 from scripts.pc_encoder import PointCloudEncoder
 from scripts.pointnet_encoder import get_point_cloud_name_reg
-from scripts.tester import get_mesh_from_pc
+from scripts.util import get_mesh_from_pc, count_label_entries
 from view_renderer import PointRenderer, MeshRendererMVDream
 
 working_dir = os.path.dirname(os.path.abspath(__file__))
@@ -102,9 +102,13 @@ class ShapeDreamDataModule(L.LightningDataModule):
 
     def _build_sample_list(self, start: int, end: int) -> list[str]:
         samples = []
-        for a in range(start, end):
-            for cl in self.class_names:
-                samples.append(f"shapenet_{cl}{a}.ply")
+        for cl in self.class_names:
+            for a in range(start, end):
+                num_obj = count_label_entries(cl)
+                # We will do an 80/10/10 split
+                if a > num_obj * 0.8:
+                    break
+                samples.append(f"shapenet_{cl}{a}")
         return samples
 
 
@@ -134,6 +138,7 @@ class ShapeDreamDataModule(L.LightningDataModule):
         val_path   = os.path.join(self.cache_dir, "val_cache.pt")
 
         os.makedirs(self.cache_dir, exist_ok=True)
+        # The objects are counted from 1 up
         train_samples = self._build_sample_list(1, self.num_samples + 1)
         train_cache = self.build_cache(train_samples, f"{self.debug_dir}/train")
         torch.save({"cache": train_cache, "samples": train_samples}, train_path)
@@ -190,7 +195,7 @@ class ShapeDreamDataModule(L.LightningDataModule):
             points = points.squeeze(0)
             normals = normals.squeeze(0)
             N_pool, _ = points.shape
-            offset = random.random() * 0.015
+            offset = random.random() * 0.0
             percentage_kept = 0.75
             dropout_mask = torch.rand(N_pool, device=self.device) < (4096 / N_pool * percentage_kept)
 
@@ -220,6 +225,7 @@ class ShapeDreamDataModule(L.LightningDataModule):
                 "z": z.cpu(),
                 "c_text": c_text.cpu(),
             })
+            pbar.set_description(f"Processed {sample}")
             pbar.update(1)
 
         return cache
@@ -263,7 +269,7 @@ class ShapeDreamDataModule(L.LightningDataModule):
             faces = faces.to(self.device)
         else:
             # For .obj files, load_objs_as_meshes is often more robust
-            mesh = load_objs_as_meshes([mesh_path], device=self.device, load_textures=textures)
+            mesh = load_objs_as_meshes([Path(mesh_path)], device=self.device, load_textures=textures)
             verts = mesh.verts_packed()
             faces = mesh.faces_packed()
 

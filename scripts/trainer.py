@@ -117,7 +117,7 @@ class LoRATrainer(LightningModule):
         self.save_hyperparameters()
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.lora_param_list + list(self.projector.parameters()), lr=1.1e-4,)
+        optimizer = torch.optim.AdamW(self.lora_param_list + list(self.projector.parameters()), lr=1e-4,)
         return optimizer
 
     def setup(self, stage: str):

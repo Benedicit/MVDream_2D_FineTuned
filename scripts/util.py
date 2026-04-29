@@ -1,7 +1,9 @@
 import os
 from PIL import Image as PilImage
 import numpy as np
+import pandas as pd
 
+script_dir = os.path.dirname(os.path.abspath(__file__))
 
 def save_training_views_grid(imgs, out_path, pad=16):
     """
@@ -24,3 +26,12 @@ def save_training_views_grid(imgs, out_path, pad=16):
     PilImage.fromarray(canvas).save(out_path)
     print("Saved training views grid to", out_path)
 
+gso_csv = f"{script_dir}/../../data/gso_label_to_mesh.csv"
+shapenet_csv = f"{script_dir}/../../data/shapenet_label_to_mesh.csv"
+mapping_shapenet = pd.read_csv(shapenet_csv) if os.path.exists(shapenet_csv) else None
+
+def get_mesh_from_pc(pointcloud_name):
+    return mapping_shapenet.loc[mapping_shapenet["pc_id"] == pointcloud_name, "filename"].iloc[0]
+
+def count_label_entries(label):
+    return len(mapping_shapenet[mapping_shapenet["label"] == label])

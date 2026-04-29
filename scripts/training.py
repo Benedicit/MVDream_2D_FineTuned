@@ -1,5 +1,6 @@
 import os
 import warnings
+from datetime import timedelta
 
 import lightning as L
 import torch
@@ -22,16 +23,16 @@ def train():
     L.seed_everything(42)
     torch.set_float32_matmul_precision("medium")
 
-    num_samples = 2000
+    num_samples = 3000
     batch_size = 16
-    num_epochs = 1000
+    num_epochs = 400
 
-    class_names = [#"airplane",
+    class_names = ["airplane",
                    #"bag",
                    #"basket",
                    #"bathtub",
                    #"bed",
-                   #"bench",
+                   "bench",
                    #"birdhouse",
                    #"bookshelf",
                    #"bottle",
@@ -56,7 +57,7 @@ def train():
                    #"jar",
                    #"keyboard",
                    #"knife",
-                   #"lamp",
+                   "lamp",
                    #"laptop",
                    #"loudspeaker",
                    #"mailbox",
@@ -74,7 +75,7 @@ def train():
                    #"skateboard",
                    #"sofa",
                    #"stove",
-                   #"table",
+                   "table",
                    #"telephone",
                    #"tower",
                    #"train",
@@ -133,7 +134,8 @@ def train():
         reload_dataloaders_every_n_epochs=0,
         strategy=DDPStrategy(
             static_graph=True,
-            find_unused_parameters=False),
+            find_unused_parameters=False,
+            timeout=timedelta(days=3.0)),
         #val_check_interval=val_every_n_steps,
     )
 

@@ -3,7 +3,6 @@ import torch.nn as nn
 import numpy as np
 import utonia
 import torch.nn.functional as F
-from torch_geometric.utils import to_dense_batch
 
 class SwiGLU(nn.Module):
     """
@@ -224,7 +223,7 @@ class PointCloudEncoder(nn.Module):
                     points[key] = points[key].cuda(non_blocking=True)
 
             points = self.encoder(points)
-
+        # NOTE: Going up the hierarchy is currently not used
         for _ in range(0):
             assert "pooling_parent" in points.keys()
             assert "pooling_inverse" in points.keys()

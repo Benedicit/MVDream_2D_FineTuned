@@ -24,7 +24,7 @@ def test_samples(tester: Tester3D, test_samples):
 
     os.makedirs("samples", exist_ok=True)
 
-    #make_gt_of_sample_list(tester, test_samples, save_grid=True, save_4_views=False, generate_3D=False)
+    #make_gt_of_sample_list(tester, test_samples, save_grid=False, save_4_views=True, generate_3D=True)
 
     for sample in test_samples:
         
@@ -51,7 +51,7 @@ def test_samples(tester: Tester3D, test_samples):
 if __name__ == "__main__":
     working_dir = str(Path(__file__).parent.parent.parent.absolute()) + "/mvdream_2D/scripts"
     seed_everything(42)
-    tester = Tester3D(ckpt_path=f"{working_dir}/checkpoints/shapedream_flowmatching_utonia_1_classes_800_2l_dist.ckpt",
+    tester = Tester3D(ckpt_path=f"{working_dir}/checkpoints/shapedream_flowmatching_utonia_1_classes_2000_2l_dist-v1.ckpt",
                       lora_rank=64,
                       flow_matching=True,
                       )
@@ -79,7 +79,7 @@ if __name__ == "__main__":
     classes = ["chair"]
     for cl in classes:
         for i in range(4250, 4500):
-            train_samples.append(f"shapenet_chair{i}.ply")
+            train_samples.append(f"shapenet_chair{i}")
             #train_samples.append(f"shapenet_chair1513.ply")
     test_samples(tester, train_samples)
     #make_gt_of_sample_list(tester, train_samples, generate_3D=True)

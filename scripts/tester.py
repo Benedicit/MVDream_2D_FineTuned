@@ -39,6 +39,7 @@ from snap_gtr.utils.io_utils import read_yaml, EasyDict
 from snap_gtr.utils.render_utils import get_cameras, np_fov_to_intrinsic, invert_transform
 from snap_gtr.engine.optimizers import Optimizers
 from yanx_pointnet2_encoder import YanxPointNet2Encoder
+from trimesh.smoothing import filter_laplacian, filter_humphrey
 
 from view_renderer import PointRenderer, MeshRendererMVDream
 import math
@@ -48,17 +49,8 @@ from transformers import AutoModelForImageSegmentation
 
 from pc_encoder import PointCloudEncoder, PointCloudTransformerSmall
 from util import save_training_views_grid
-import pandas as pd
 from trainer import LoRATrainer
-
-script_dir = os.path.dirname(os.path.abspath(__file__))
-
-gso_csv = f"{script_dir}/../../data/gso_label_to_mesh.csv"
-shapenet_csv = f"{script_dir}/../../data/shapenet_label_to_mesh.csv"
-mapping_shapenet = pd.read_csv(shapenet_csv) if os.path.exists(shapenet_csv) else None
-
-def get_mesh_from_pc(pointcloud_name):
-    return mapping_shapenet.loc[mapping_shapenet["label"] == pointcloud_name, "filename"].iloc[0]
+from util import get_mesh_from_pc
 
 class Tester3D:
     def __init__(self,
@@ -326,7 +318,7 @@ class Tester3D:
         Image.fromarray(canvas).save(out_path)
         print("Saved", out_path)
 
-    def images_to_3D(self, object_path, render_mesh_res=512, render_nerf_res=1024, refine_texture=False):
+    def images_to_3D(self, object_path, render_mesh_res=512, render_nerf_res=1024, refine_texture=False, smoothing=0.0):
 
         out_dir = Path(object_path)
         in_dir  = Path(object_path)
@@ -387,8 +379,12 @@ class Tester3D:
         mesh_file = f"{out_dir}/mesh.obj"
         logger.info(f"Provide code to extract mesh")
         mesh_list = self.snap_model.extract_geometry(data_batch, resolution=512, level=10, code=code)
+        mesh = mesh_list[0]
+        filter_humphrey(mesh, beta=smoothing, iterations=2)
+
         logger.info(f"Extract mesh")
-        mesh_list[0].export(mesh_file)
+        #mesh_list[0].export(mesh_file)
+        mesh.export(mesh_file)
 
     @torch.no_grad()
     def remove_bg_with_birefnet(self, rgb_u8: np.ndarray) -> Image.Image:

@@ -2,6 +2,7 @@ import torch
 import math
 import os
 os.environ["PYTORCH3D_IGNORE_BIN_SIZE_WARNING"] = "1"
+
 from pytorch3d.structures import Pointclouds
 from pytorch3d.renderer import (
     PointsRasterizationSettings,
@@ -178,9 +179,17 @@ class MeshRendererMVDream(MVDreamRenderer):
     def __init__(self, device='cuda', image_size=256, fov_deg=50.0):
         super().__init__(device, image_size, fov_deg)
         # Rasterization settings for meshes
-        raster_settings = RasterizationSettings(
+        raster_settings_heur = RasterizationSettings(
             image_size=image_size,
             blur_radius=0.0, 
+            faces_per_pixel=1,
+            #bin_size=0,
+            bin_size=None,
+            max_faces_per_bin=200_000
+        )
+        raster_settings_naive = RasterizationSettings(
+            image_size=image_size,
+            blur_radius=0.0,
             faces_per_pixel=1,
             bin_size=0,
         )
@@ -189,9 +198,13 @@ class MeshRendererMVDream(MVDreamRenderer):
         # Without lights, the mesh will appear black.
         lights = AmbientLights(device=device, ambient_color=((1.0, 1.0, 1.0),))
 
-        self.renderer = MeshRenderer(
-            rasterizer=MeshRasterizer(raster_settings=raster_settings),
+        self.renderer_heur = MeshRenderer(
+            rasterizer=MeshRasterizer(raster_settings=raster_settings_heur),
             shader=SoftPhongShader(device=device, lights=lights)).to(device)
+        self.renderer_naive = MeshRenderer(
+            rasterizer=MeshRasterizer(raster_settings=raster_settings_naive),
+            shader=SoftPhongShader(device=device, lights=lights)).to(device)
+
 
     @torch.no_grad()
     def render_mvdream_views(self, verts, faces, camera, dist_scale=2.5, interpolation="sine", mesh=None):
@@ -231,7 +244,7 @@ class MeshRendererMVDream(MVDreamRenderer):
         mesh_expanded = mesh.extend(Vviews)
 
         # Use the standard renderer to visualize the texture
-        rendered = self.renderer(mesh_expanded, cameras=cameras)
+        rendered = self.renderer_naive(mesh_expanded, cameras=cameras)
 
         rgb = rendered[..., :3]
         out = rgb.permute(0, 3, 1, 2) * 2.0 - 1.0
