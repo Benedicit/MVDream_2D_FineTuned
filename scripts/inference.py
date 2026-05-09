@@ -18,7 +18,7 @@ OUTPUT_DIR = working_dir + "/../debug"
 MESH_DIR = working_dir + "/../debug_3D"
 
 base_path = f"{working_dir}/../../data/dataset_masked/"
-save_path = f"{working_dir}/debug2/"
+save_path = f"{working_dir}/debug/"
 
 def test_samples(tester: Tester3D, test_samples):
 
@@ -36,7 +36,6 @@ def test_samples(tester: Tester3D, test_samples):
             pointcloud_path=base_path + sample,
             prompt=f"a {prompt}",
             use_pointcloud=True,
-            start_from_noise=True,
             save_pc_renders=False,
         )
         #tester.save_view_grid(imgs_pc,  f"samples/{full_name}_samples.png")
@@ -51,10 +50,12 @@ def test_samples(tester: Tester3D, test_samples):
 if __name__ == "__main__":
     working_dir = str(Path(__file__).parent.parent.parent.absolute()) + "/mvdream_2D/scripts"
     seed_everything(42)
-    tester = Tester3D(ckpt_path=f"{working_dir}/checkpoints/shapedream_flowmatching_utonia_1_classes_2000_2l_dist-v1.ckpt",
+    tester = Tester3D(ckpt_path=f"{working_dir}/checkpoints/shapedream_flowmatching_1_classes_2000-v2.ckpt",
                       lora_rank=64,
                       flow_matching=True,
+                      start_from_noise=True,
                       )
+
     torch.set_float32_matmul_precision('high')
     '''
     train_samples = [
@@ -77,6 +78,7 @@ if __name__ == "__main__":
     train_samples = []
     classes = ["bench", "chair", "car", "table"]
     classes = ["chair"]
+    print("HELLO")
     for cl in classes:
         for i in range(4250, 4500):
             train_samples.append(f"shapenet_chair{i}")

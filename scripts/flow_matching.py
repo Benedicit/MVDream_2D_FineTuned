@@ -321,8 +321,6 @@ class FlowMatching(nn.Module):
         Sample the v-parameterized vector field at time t
         """
         dm_t = self.convert_fm_t_to_dm_t(fm_t)
-        #print("ALAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARM")
-        #print(fm_t, dm_t)
         dm_t_int = dm_t.long()
         dm_x = self.convert_fm_xt_to_dm_xt(fm_x, fm_t)
         # vt = self.net(dm_x, dm_t, **kwargs)

@@ -144,9 +144,12 @@ class ShapeDreamDataModule(L.LightningDataModule):
         torch.save({"cache": train_cache, "samples": train_samples}, train_path)
 
         if not os.path.exists(val_path):
+            """
             num_val = int(self.num_samples * 0.1)
             num_val += num_val % self.batch_size
             num_val = max(self.batch_size, num_val)
+            """
+            num_val = 96
             val_start = self.num_samples + 50
             val_samples = self._build_sample_list(val_start, val_start + num_val)
             val_cache = self.build_cache(val_samples, f"{self.debug_dir}/val")
@@ -202,8 +205,13 @@ class ShapeDreamDataModule(L.LightningDataModule):
             for split_axis, key in [(0, "pc_feat_x_split"), (2, "pc_feat_z_split")]:
                 axis_mask = points[..., split_axis] > offset
                 mask = axis_mask & dropout_mask
+                if mask.sum() < 100:
+                    axis_mask = points[..., 1] > offset
+                    mask = axis_mask & dropout_mask
+
                 flat_points = points[mask].detach().cpu()
                 flat_normals = normals[mask].detach().cpu()
+
 
                 feat, _ = self._pc_encoder(flat_points)
                 cache.setdefault(sample, {})[key] = feat.squeeze(0).detach().cpu()

@@ -60,6 +60,7 @@ class Tester3D:
                  AZIM_SPAN=360.0,
                  model="sd-v2.1-base-4view",
                  flow_matching= True,
+                 start_from_noise=True,
                  lora_rank=32,
                  alpha=8.0
                  ):
@@ -69,6 +70,7 @@ class Tester3D:
         self.ELEV_DEG = ELEV_DEG
         self.AZIM_START = AZIM_START
         self.AZIM_SPAN = AZIM_SPAN
+        self.start_from_noise = start_from_noise
 
         self.pointnet = YanxPointNet2Encoder(
             normal_channel=False,
@@ -102,38 +104,14 @@ class Tester3D:
         self.snap_grad_scaler = GradScaler(enabled=True, init_scale=2048)
         self.snap_grad_scaler.load_state_dict(self.snap_state_dict["scalers"])
 
-        '''
-        self.model = build_model(model)
-        self.model.to(self.device)
-        self.model.device = self.device
-        self.unet = self.model.model.diffusion_model
-        self.unet.to(self.device)
-        if flow_matching:
-            add_lora_to_all_layers(self.unet, r=lora_rank, alpha=alpha)
-        else:
-            add_lora_to_cross_att_only(self.unet, r=lora_rank, alpha=alpha)
-
-        self.projector = PointCloudTransformerSmall(n_self_attn_layers=2, num_tokens=4)
-
-        
-        self.encoder = PointCloudEncoder()
-
-        # load module
-        ckpt = torch.load(self.ckpt_path, map_location="cpu")
-        self.model.load_state_dict(ckpt["model"], strict=False)
-        self.projector.load_state_dict(ckpt["projector"], strict=True)
-
-        self.model.device = self.device
-        self.model.eval()
-        self.projector.eval()
-        '''
         ckpt = torch.load(self.ckpt_path, map_location=self.device)
         state_dict = ckpt["state_dict"]
         #state_dict = _remap_state_dict(ckpt["state_dict"])
         self._module = LoRATrainer(
             lora_rank=lora_rank,
             lora_alpha=alpha,
-            flow_matching=flow_matching
+            flow_matching=flow_matching,
+            start_from_noise=start_from_noise
         )
         self._module.load_state_dict(state_dict, strict=True)
 
@@ -174,8 +152,6 @@ class Tester3D:
         W: int = 256,
         steps: int = 100,
         scale: float = 7.5,
-        seed: int = 42,
-        start_from_noise=True,
         save_pc_renders=False,
 
     ):
@@ -241,15 +217,12 @@ class Tester3D:
             )
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            pc_tokens, pc_latent = self.projector(pc_feat, mask, self.camera.unsqueeze(0))  # [V,K,C]
+            pc_tokens = self.projector(pc_feat, mask, self.camera.unsqueeze(0))  # [V,K,C]
         if use_pointcloud:
 
             #cond_context = torch.cat([c_text, pc_tokens], dim=1)                   # [V,L+K,C]
             cond_context = torch.cat([pc_tokens], dim=1).to(self.device)                   # [V,L+K,C]
-
-            uc_pc_tokens = torch.zeros_like(pc_tokens, device=self.device)
-            uc_context = torch.cat([uc_pc_tokens], dim=1).to(self.device)                    # [V,L+K,C]
-            #uc_context = torch.cat([uc_pc_tokens], dim=1)                    # [V,L+K,C]
+            uc_context = torch.zeros_like(cond_context)
         else:
             cond_context = c_text                                                  # [V,L,C]
             uc_context = uc_text                                                   # [V,L,C]
@@ -266,11 +239,10 @@ class Tester3D:
             "num_frames": num_views,
         }
         if self.flow_matching:
-            if start_from_noise:
+            if self.start_from_noise:
                 x_source = torch.randn(latent_shape, device=self.device)
             else:
-                noise = torch.randn_like(pc_latent) * 0.15
-                x_source = pc_latent + noise
+                x_source = self._module.latent_projector(pc_feat, mask, self.camera.unsqueeze(0))
 
             args = {
                 "num_steps" : steps,

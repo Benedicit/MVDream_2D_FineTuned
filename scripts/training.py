@@ -4,7 +4,7 @@ from datetime import timedelta
 
 import lightning as L
 import torch
-from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
+from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.strategies import DDPStrategy
 
@@ -23,16 +23,16 @@ def train():
     L.seed_everything(42)
     torch.set_float32_matmul_precision("medium")
 
-    num_samples = 3000
+    num_samples = 2000
     batch_size = 16
-    num_epochs = 400
+    num_epochs = 1000
 
-    class_names = ["airplane",
+    class_names = [#"airplane",
                    #"bag",
                    #"basket",
                    #"bathtub",
                    #"bed",
-                   "bench",
+                   #"bench",
                    #"birdhouse",
                    #"bookshelf",
                    #"bottle",
@@ -57,7 +57,7 @@ def train():
                    #"jar",
                    #"keyboard",
                    #"knife",
-                   "lamp",
+                   #"lamp",
                    #"laptop",
                    #"loudspeaker",
                    #"mailbox",
@@ -75,7 +75,7 @@ def train():
                    #"skateboard",
                    #"sofa",
                    #"stove",
-                   "table",
+                   #"table",
                    #"telephone",
                    #"tower",
                    #"train",
@@ -95,6 +95,10 @@ def train():
         start_from_noise=True,
         load_from_ckpth=False,
         no_compile=False,
+        lr=2e-4,
+        #lr=5e-4,
+        batch_size=batch_size,
+        num_epochs=num_epochs,
     )
 
     # Pass model_ref so DataModule can call build_cache with the right internals
@@ -110,28 +114,32 @@ def train():
 
     checkpoint_callback = ModelCheckpoint(
         dirpath="checkpoints/",
-        filename=f"shapedream_{suffix}_utonia_{len(class_names)}_classes_{num_samples}_2l_dist",
+        filename=f"shapedream_{suffix}_{len(class_names)}_classes_{num_samples}",
         monitor=None,
         save_weights_only=True,
         every_n_epochs=min(num_epochs, 50),
         save_top_k=1,
         save_last=False,
+        save_on_train_epoch_end=True,
     )
 
-    val_every_n_steps = (num_samples * 20) // batch_size
+    lr_monitor = LearningRateMonitor(logging_interval='epoch')
 
     trainer = L.Trainer(
         max_epochs=num_epochs,
         precision="bf16-mixed",
         accelerator="gpu",
         devices="auto",
-        logger=TensorBoardLogger(save_dir="logs", name="two_self_attn_long"),
-        callbacks=[checkpoint_callback, TQDMProgressBar(refresh_rate=5)],
+        logger=TensorBoardLogger(save_dir="logs", name="deep_transformer"),
+        callbacks=[checkpoint_callback, TQDMProgressBar(refresh_rate=5), lr_monitor],
         log_every_n_steps=50,
         num_sanity_val_steps=0,
         # Skip validation...
         limit_val_batches=0.0,
+        check_val_every_n_epoch=20,
         reload_dataloaders_every_n_epochs=0,
+        gradient_clip_val=1.0,
+        gradient_clip_algorithm="norm",
         strategy=DDPStrategy(
             static_graph=True,
             find_unused_parameters=False,

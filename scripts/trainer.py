@@ -1,6 +1,10 @@
 import os
 import sys
 
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torchvision import transforms
+from transformers import get_cosine_with_min_lr_schedule_with_warmup
+
 working_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, working_dir)
 
@@ -15,8 +19,9 @@ from lora import add_lora_to_cross_att_only, add_lora_to_all_layers, LoRALinear
 from mvdream.camera_utils import get_camera
 from mvdream.ldm.models.diffusion.ddim import DDIMSampler
 from mvdream.model_zoo import build_model
-from pc_encoder import PointCloudTransformerSmall
+from pc_encoder import PointCloudTransformerSmall, PointCloudToLatent
 from view_renderer import PointRenderer
+from transformers import AutoModelForImageSegmentation
 
 from flow_matching import FlowMatching
 
@@ -41,13 +46,19 @@ class LoRATrainer(LightningModule):
                  num_views=4,
                  load_from_ckpth: bool = False,
                  ckpt_path="",
-                 no_compile=False):
+                 no_compile=False,
+                 lr=1e-4,
+                 batch_size=16,
+                 num_epochs=500):
         super().__init__()
         self.model = build_model(model_name=model_name)
 
         self.unet = self.model.model.diffusion_model
         self.flow_matching = flow_matching
         self.start_from_noise = start_from_noise
+        self.lr = lr
+        self.batch_size = batch_size
+        self.num_epochs = num_epochs
 
         if flow_matching:
             add_lora_to_all_layers(self.unet, r=lora_rank, alpha=lora_alpha)
@@ -77,7 +88,14 @@ class LoRATrainer(LightningModule):
         #self.pc_encoder = PointCloudEncoder()
         self.no_compile = no_compile
 
-        self.projector = PointCloudTransformerSmall(n_self_attn_layers=2, num_tokens=4)
+        self.projector = PointCloudTransformerSmall(
+            n_self_attn_layers=6,
+            n_cross_attn_layers=3,
+            num_tokens=4,
+            latent_dim=192,
+            n_heads=6,
+        )
+        
         for p in self.projector.parameters():
             p.requires_grad_(True)
 
@@ -105,20 +123,56 @@ class LoRATrainer(LightningModule):
 
         self.pytorch3d_io = pytorch3d.io.IO()
 
+        self.birefnet = AutoModelForImageSegmentation.from_pretrained('zhengpeng7/BiRefNet', trust_remote_code=True)
+        for p in self.birefnet.parameters():
+            p.requires_grad_(False)
+        self.birefnet.eval()
+
         self.compiled_wrapper = self.training_wrapper
         self.projector_fwd = self.projector.forward
 
         if self.flow_matching:
             #add_lora_to_attention_and_conv(self.unet, r=lora_rank, alpha=lora_alpha)
             self.sampler = FlowMatching(self.model)
+            if self.start_from_noise:
+                self.latent_projector = None
+            else:
+                self.latent_projector = PointCloudToLatent(n_self_attn_layers=1)
+                print(f"Latent projector parameters: {sum(p.numel() for p in self.latent_projector.parameters())/1e6:.3f}M")
+                self.latent_projector_fwd = self.latent_projector.forward
             #self.compiled_wrapper = torch.compile(self.training_wrapper, mode="max-autotune", dynamic=False, disable=no_compile)
         else:
             self.sampler = DDIMSampler(self.model)
+            self.latent_projector = None
         self.save_hyperparameters()
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.lora_param_list + list(self.projector.parameters()), lr=1e-4,)
-        return optimizer
+        if self.flow_matching and not self.start_from_noise:
+            optimizer = torch.optim.AdamW(
+                self.lora_param_list + list(self.projector.parameters()) + list(self.latent_projector.parameters()),
+                lr=self.lr,
+                weight_decay=1e-2,
+            )
+        else:
+            optimizer = torch.optim.AdamW(
+                self.lora_param_list + list(self.projector.parameters()),
+                lr=self.lr,
+                weight_decay=1e-2,
+                )
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=self.num_epochs,
+            eta_min=1e-5
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1
+            },
+        }
 
     def setup(self, stage: str):
         if hasattr(self, "_model_configured"):
@@ -128,13 +182,20 @@ class LoRATrainer(LightningModule):
             self.projector.forward,
             dynamic=True,
             disable=self.no_compile,
-        )
+            )
+        if self.flow_matching and not self.start_from_noise:
+            self.latent_projector_fwd = torch.compile(
+                self.latent_projector.forward,
+                dynamic=True,
+                disable=self.no_compile,
+            )
         self.compiled_wrapper = torch.compile(
             self.training_wrapper,
             mode="max-autotune",
             dynamic=False,
             disable=self.no_compile,
         )
+
         self._model_configured = True
 
     def training_wrapper(self, x1, x0, cond, t):
@@ -185,13 +246,18 @@ class LoRATrainer(LightningModule):
         c_text_flat = c_text.view(B * V, c_text.shape[-2], c_text.shape[-1])
 
         t = torch.rand((B,), device=self.device).repeat_interleave(V)
+        #t = torch.rand((B * V,), device=self.device)
 
         cameras  = camera_flat.view(camera_flat.shape[0] // V, V, -1)
         #pc_tokens, pc_latent = self.projector_fwd(pc_feat, pc_feat_mask, cameras)
-        pc_tokens, pc_latent = self.projector_fwd(pc_feat, pc_feat_mask, cameras)
+        pc_tokens = self.projector_fwd(pc_feat, pc_feat_mask, cameras)
 
-        if torch.rand(1).item() < 0.1:
-            pc_tokens = pc_tokens * 0.0
+        # Random dropout of tokens
+        drop_mask = torch.rand(B*V, device=self.device) < 0.1
+        drop_mask = drop_mask.view(B*V, 1, 1)
+        null_tokens = self.projector.get_null_context(batch_size=B*V)
+
+        pc_tokens = torch.where(drop_mask, null_tokens, pc_tokens)
 
         cond = {"context": pc_tokens, "camera": camera_flat, "num_frames": V}
 
@@ -199,8 +265,16 @@ class LoRATrainer(LightningModule):
             if self.start_from_noise:
                 loss = self.compiled_wrapper(x1=z_flat, x0=None, cond=cond, t=t)
             else:
-                noise_reg = torch.randn_like(pc_latent) * 0.2
-                loss = self.compiled_wrapper(x1=z_flat, x0=pc_latent + noise_reg, cond=cond, t=t)
+                # Also add some noise to the features
+                pc_feat = pc_feat + torch.randn_like(pc_feat) * 0.10
+                pc_latent = self.latent_projector_fwd(pc_feat, pc_feat_mask, cameras)
+                # Dropout of latent to enhance only the tokens
+                if torch.rand(1).item() < 0.25:
+                    latent = torch.randn_like(pc_latent) + 0.0 * pc_latent
+                else:
+                    noise_reg = torch.randn_like(pc_latent) * 0.30
+                    latent = pc_latent + noise_reg
+                loss = self.compiled_wrapper(x1=z_flat, x0=latent, cond=cond, t=t)
                 reg_loss = torch.mean(pc_latent) ** 2 + (torch.std(pc_latent) - 1) ** 2
                 loss = loss + 0.1 * reg_loss
         else:
@@ -216,14 +290,18 @@ class LoRATrainer(LightningModule):
     def validation_step(self, batch, batch_idx):
         z        = batch["z"].contiguous()
         pc_feat  = batch["pc_feat"].contiguous()
+        pc_feat_mask = batch["pc_feat_mask"].contiguous()
         c_text   = batch["c_text"].contiguous()
 
         B, V, C_lat, H_lat, W_lat = z.shape
         cameras_flat = self.camera.unsqueeze(0).repeat_interleave(B, dim=0).view(B * V, 16)
         cameras      = cameras_flat.view(B, V, 16)
 
-        #pc_tokens, pc_latent = self.projector_fwd(pc_feat, batch["pc_feat_mask"], cameras)
-        pc_tokens, pc_latent = self.projector(pc_feat, batch["pc_feat_mask"], cameras)
+        pc_tokens = self.projector(pc_feat, pc_feat_mask, cameras)
+        if self.start_from_noise:
+            pc_latent = torch.randn_like(z)
+        else:
+            pc_latent = self.latent_projector_fwd(pc_feat, pc_feat_mask, cameras)
 
         gen_pixels, samples = self.sample_multiview(
             pc_tokens=pc_tokens,
@@ -237,13 +315,49 @@ class LoRATrainer(LightningModule):
 
         z_gt_flat = z.view(B * V, C_lat, H_lat, W_lat)
         gt_pixels = torch.clamp((self.model.decode_first_stage(z_gt_flat) + 1) / 2, 0, 1)
-        gt_pixels = (gt_pixels * 255).permute(0, 2, 3, 1).view(B, V, self.H, self.W, -1).float()
+        gt_pixels = (gt_pixels * 255).permute(0, 2, 3, 1).view(B, V, self.H, self.W, -1)
 
         mse = F.mse_loss(z, samples)
-        l1  = F.l1_loss(gen_pixels, gt_pixels)
+        l1  = F.l1_loss(gen_pixels.float(), gt_pixels.float())
 
-        self.log("val/mse", mse, prog_bar=True)
-        self.log("val/l1", l1, prog_bar=True)
+        image_size = (1024, 1024)
+
+        gt_pixels_flat = gt_pixels.view(B*V, self.H, self.W, -1)
+        gen_pixels_flat = gen_pixels.view(B*V, self.H, self.W, -1)
+
+        # Permute to (N, C, H, W) and scale back to [0, 1]
+        gt_pixels_bchw = gt_pixels_flat.permute(0, 3, 1, 2) / 255.0
+        gen_pixels_bchw = gen_pixels_flat.permute(0, 3, 1, 2) / 255.0
+
+        # Resize to 1024x1024
+        gt_pixels_resized = F.interpolate(gt_pixels_bchw, size=image_size, mode='bilinear', align_corners=False)
+        gen_pixels_resized = F.interpolate(gen_pixels_bchw, size=image_size, mode='bilinear', align_corners=False)
+
+        # Normalize
+        normalize = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        gt_pixels_input = normalize(gt_pixels_resized)
+        gen_pixels_input = normalize(gen_pixels_resized)
+
+        alpha_preds_gt = []
+        alpha_preds_gen = []
+
+        # Process through BiRefNet one by one to avoid OOM
+        for i in range(gt_pixels_input.shape[0]):
+            with torch.no_grad():
+                pred_gt = self.birefnet(gt_pixels_input[i:i+1])[-1].sigmoid()
+                pred_gen = self.birefnet(gen_pixels_input[i:i+1])[-1].sigmoid()
+                alpha_preds_gt.append(pred_gt[0])
+                alpha_preds_gen.append(pred_gen[0])
+
+        alpha_pred_gt = torch.cat(alpha_preds_gt, dim=0)
+        alpha_pred_gen = torch.cat(alpha_preds_gen, dim=0)
+        l1_alpha = F.l1_loss(alpha_pred_gen, alpha_pred_gt)
+        mse_alpha = F.mse_loss(alpha_pred_gen, alpha_pred_gt)
+
+        self.log("val/mse", mse, prog_bar=True, sync_dist=True)
+        self.log("val/l1_img", l1, prog_bar=False, sync_dist=True)
+        self.log("val/l1_alpha", l1_alpha, prog_bar=True, sync_dist=True)
+        self.log("val/mse_alpha", mse_alpha, prog_bar=False, sync_dist=True)
 
 
     @torch.no_grad()
@@ -270,7 +384,8 @@ class LoRATrainer(LightningModule):
         if use_pointcloud:
             cond_context = torch.cat([pc_tokens], dim=1).to(self.device)         # [V,K,C]
 
-            uc_pc_tokens = torch.zeros_like(pc_tokens, device=self.device)
+            #uc_pc_tokens = torch.zeros_like(pc_tokens, device=self.device)
+            uc_pc_tokens = self.projector.get_null_context(batch_size=B * num_views)
             uc_context = torch.cat([uc_pc_tokens], dim=1).to(self.device)                    # [V,L+K,C]
 
         else:
@@ -301,6 +416,8 @@ class LoRATrainer(LightningModule):
                 }
                 if self.start_from_noise:
                     x_source = torch.randn((B * num_views, 4, H // 8, W // 8), device=self.device, dtype=torch.bfloat16)
+                else:
+                    x_source = pc_latent
                 x_source = x_source.to(self.device)
                 samples = self.sampler.generate(x=x_source, sample_kwargs=args)
         else:
@@ -320,4 +437,4 @@ class LoRATrainer(LightningModule):
         x = torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
         x = (x * 255.0).permute(0, 2, 3, 1).view(B,self.num_views,self.H, self.W,-1)
         samples = samples.view(B, num_views, 4, 32, 32)
-        return x.to(torch.float32), samples
+        return x, samples

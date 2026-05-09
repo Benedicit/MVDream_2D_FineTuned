@@ -65,58 +65,144 @@ class PointCloudSelfAttnBlock(nn.Module):
 class PointCloudTransformerSmall(nn.Module):
     def __init__(
             self,
-            n_heads=4,
+            n_heads=8,
             num_views=4,
             num_tokens=4,
-            n_self_attn_layers=4,
+            n_self_attn_layers=2,
+            n_cross_attn_layers=1,
             latent_dim=256,
             mvdream_context_size=1024,
             utonia_feat_dim=576,
+            token_init_std=0.05,
     ):
         super().__init__()
-        self.num_views  = num_views
+        self.num_views = num_views
         self.num_tokens = num_tokens
-        total_tokens    = num_views * num_tokens  # 16
+        self.n_self_attn_layers = n_self_attn_layers
+        self.n_cross_attn_layers = n_cross_attn_layers
 
-        self.camera_encoder = nn.Sequential(
-            nn.Linear(16, latent_dim),
-            nn.SiLU(),
-            nn.Linear(latent_dim, latent_dim),
+        # Factorized embeddings:
+        #   view_tokens:       view identity, e.g. front/side/back/side
+        #   token_role_tokens: token slot identity within each view
+        self.view_tokens = nn.Parameter(
+            torch.randn(1, num_views, 1, latent_dim) * token_init_std
+        )
+        self.token_role_tokens = nn.Parameter(
+            torch.randn(1, 1, num_tokens, latent_dim) * token_init_std
         )
 
-        # Learnable latent tokens + view-index embeddings for consistency
-        self.latent_tokens = nn.Parameter(torch.randn(1, total_tokens, latent_dim))
+        self.cross_attn_layers = nn.ModuleList([
+            PointCloudCrossAttnBlock(latent_dim, utonia_feat_dim, n_heads)
+            for _ in range(n_cross_attn_layers)
+        ])
 
-        # 1 cross-attention block (reads point cloud)
-        self.cross_attn = PointCloudCrossAttnBlock(latent_dim, utonia_feat_dim, n_heads)
-
-        # N self-attention blocks (view consistency + refinement)
-        self.self_attn_blocks = nn.ModuleList([
+        self.self_attn_layers = nn.ModuleList([
             PointCloudSelfAttnBlock(latent_dim, n_heads)
             for _ in range(n_self_attn_layers)
         ])
 
+        self.out_norm = nn.LayerNorm(latent_dim)
         self.up_proj = nn.Linear(latent_dim, mvdream_context_size)
+
+        self.register_buffer('null_context', torch.zeros(1, num_tokens, mvdream_context_size))
+
+    def get_null_context(self, batch_size):
+        return self.null_context.expand(batch_size, -1, -1)
+
+    def forward(self, pc_feat, mask, cameras):
+
+        B = pc_feat.shape[0]
+        V = self.num_views
+        T = self.num_tokens
+
+        latent_tokens = (
+                self.view_tokens.expand(B, V, T, -1) +
+                self.token_role_tokens.expand(B, V, T, -1)
+        )
+
+        latent_tokens = latent_tokens.view(B, V * T, -1)
+        # self-attn -> cross-attn -> self-attn -> self-attn -> cross-attn -> ... -> self-attn
+        for i in range(len(self.self_attn_layers)):
+            latent_tokens = self.self_attn_layers[i](latent_tokens)
+            if i % 2 == 0 and i < self.n_cross_attn_layers:
+                latent_tokens = self.cross_attn_layers[i // 2](latent_tokens, pc_feat, mask)
+
+        x = self.out_norm(latent_tokens)
+        out = self.up_proj(x)  # [B, V * T, 1024]
+        out = out.view(B * V, T, -1)               # [B * V, T, 1024]
+
+        return out
+
+class PointCloudToLatent(nn.Module):
+    """Converts point cloud features to a spatial latent [B, 4, 32, 32] for flow matching."""
+    def __init__(
+            self,
+            n_heads=6,
+            num_views=4,
+            n_self_attn_layers=2,
+            n_cross_attn_layers=1,
+            latent_dim= 196,
+            utonia_feat_dim=576,
+            latent_res=32,
+    ):
+        super().__init__()
+        self.num_views = num_views
+        self.latent_res = latent_res
+
+        # Factorized learned tokens: much better view/spatial structure than one flat tensor.
+        self.spatial_tokens = nn.Parameter(
+            torch.randn(1, 1, latent_res * latent_res, latent_dim)
+        )
+        self.view_tokens = nn.Parameter(
+            torch.randn(1, num_views, 1, latent_dim)
+        )
+
+        self.cross_attn_layers = nn.ModuleList([
+            PointCloudCrossAttnBlock(latent_dim, utonia_feat_dim, n_heads)
+            for _ in range(n_cross_attn_layers)
+        ])
+
+        self.self_attn_layers = nn.ModuleList([
+            PointCloudSelfAttnBlock(latent_dim, n_heads)
+            for _ in range(n_self_attn_layers)
+        ])
+
+        # Spatial latent head. This gives the output local image/latent structure.
+        self.latent_head = nn.Sequential(
+            nn.GroupNorm(32, latent_dim),
+            nn.SiLU(),
+            nn.Conv2d(latent_dim, latent_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(32, latent_dim),
+            nn.SiLU(),
+            nn.Conv2d(latent_dim, 4, kernel_size=3, padding=1),
+        )
+
+        #nn.init.zeros_(self.latent_head[-1].weight)
+        #nn.init.zeros_(self.latent_head[-1].bias)
 
     def forward(self, pc_feat, mask, cameras):
         B = pc_feat.shape[0]
-        cam_embed = self.camera_encoder(cameras)                          # (B, 4, latent_dim)
-        cam_embed = cam_embed.repeat_interleave(self.num_tokens, dim=1)  # (B, 16, latent_dim)
+        V = self.num_views
+        H = W = self.latent_res
 
-        latent_tokens = self.latent_tokens.expand(B, -1, -1) + cam_embed
+        tokens = (
+                self.view_tokens.expand(B, V, H * W, -1) +
+                self.token_role_tokens.expand(B, V, H * W, -1)
+        )
 
-        # Cross-attend to point cloud once
-        latent_tokens = self.cross_attn(latent_tokens, pc_feat, mask)
+        tokens = tokens.view(B, V * T, -1)
+        # self-attn -> cross-attn -> self-attn -> self-attn -> cross-attn -> ... -> self-attn
+        for i in range(len(self.self_attn_layers)):
+            tokens = self.self_attn_layers[i](tokens)
+            if i % 2 == 0 and i < self.n_cross_attn_layers:
+                tokens = self.cross_attn_layers[i // 2](tokens, pc_feat, mask)
 
-        # Refine + enforce view consistency
-        for block in self.self_attn_blocks:
-            latent_tokens = block(latent_tokens)
+        tokens = tokens.view(B, V, H, W, -1)
+        tokens = tokens.permute(0, 1, 4, 2, 3).reshape(B * V, -1, H, W)
 
-        # Project to MVDream context dim and reshape for multi-view conditioning
-        out = self.up_proj(latent_tokens)                             # (B, 16, 1024)
-        out = out.view(B * self.num_views, self.num_tokens, -1)       # (B*4, 4, 1024)
+        out = self.latent_head(tokens)  # [B * V, 4, 32, 32]
 
-        return out, None
+        return out
 
 class PointCloudEncoder(nn.Module):
     """
