@@ -148,13 +148,14 @@ class PointCloudToLatent(nn.Module):
         super().__init__()
         self.num_views = num_views
         self.latent_res = latent_res
+        self.n_cross_attn_layers = n_cross_attn_layers
 
         # Factorized learned tokens: much better view/spatial structure than one flat tensor.
         self.spatial_tokens = nn.Parameter(
-            torch.randn(1, 1, latent_res * latent_res, latent_dim)
+            torch.randn(1, 1, latent_res * latent_res, latent_dim) * 0.05
         )
         self.view_tokens = nn.Parameter(
-            torch.randn(1, num_views, 1, latent_dim)
+            torch.randn(1, num_views, 1, latent_dim) * 0.05
         )
 
         self.cross_attn_layers = nn.ModuleList([
@@ -187,15 +188,14 @@ class PointCloudToLatent(nn.Module):
 
         tokens = (
                 self.view_tokens.expand(B, V, H * W, -1) +
-                self.token_role_tokens.expand(B, V, H * W, -1)
+                self.spatial_tokens .expand(B, V, H * W, -1)
         )
 
-        tokens = tokens.view(B, V * T, -1)
-        # self-attn -> cross-attn -> self-attn -> self-attn -> cross-attn -> ... -> self-attn
+        tokens = tokens.view(B, V * H * W, -1)
+
         for i in range(len(self.self_attn_layers)):
-            tokens = self.self_attn_layers[i](tokens)
-            if i % 2 == 0 and i < self.n_cross_attn_layers:
-                tokens = self.cross_attn_layers[i // 2](tokens, pc_feat, mask)
+            tokens = self.cross_attn_layers[i](tokens, pc_feat, mask)
+            #tokens = self.self_attn_layers[i](tokens)
 
         tokens = tokens.view(B, V, H, W, -1)
         tokens = tokens.permute(0, 1, 4, 2, 3).reshape(B * V, -1, H, W)

@@ -25,7 +25,7 @@ def train():
 
     num_samples = 2000
     batch_size = 16
-    num_epochs = 1000
+    num_epochs = 550
 
     class_names = [#"airplane",
                    #"bag",

@@ -84,13 +84,12 @@ class LoRATrainer(LightningModule):
                 self.lora_params.append(m.lora_up.weight)
                 lora_layer_count += 1
 
-
         #self.pc_encoder = PointCloudEncoder()
         self.no_compile = no_compile
 
         self.projector = PointCloudTransformerSmall(
-            n_self_attn_layers=6,
-            n_cross_attn_layers=3,
+            n_self_attn_layers=4,
+            n_cross_attn_layers=2,
             num_tokens=4,
             latent_dim=192,
             n_heads=6,
@@ -137,7 +136,10 @@ class LoRATrainer(LightningModule):
             if self.start_from_noise:
                 self.latent_projector = None
             else:
-                self.latent_projector = PointCloudToLatent(n_self_attn_layers=1)
+                self.latent_projector = PointCloudToLatent(n_self_attn_layers=0,
+                                                           n_cross_attn_layers=1,
+                                                           n_heads=4,
+                                                           latent_dim=128)
                 print(f"Latent projector parameters: {sum(p.numel() for p in self.latent_projector.parameters())/1e6:.3f}M")
                 self.latent_projector_fwd = self.latent_projector.forward
             #self.compiled_wrapper = torch.compile(self.training_wrapper, mode="max-autotune", dynamic=False, disable=no_compile)
@@ -266,17 +268,15 @@ class LoRATrainer(LightningModule):
                 loss = self.compiled_wrapper(x1=z_flat, x0=None, cond=cond, t=t)
             else:
                 # Also add some noise to the features
-                pc_feat = pc_feat + torch.randn_like(pc_feat) * 0.10
+                pc_feat = pc_feat + torch.randn_like(pc_feat) * 0.30
                 pc_latent = self.latent_projector_fwd(pc_feat, pc_feat_mask, cameras)
                 # Dropout of latent to enhance only the tokens
-                if torch.rand(1).item() < 0.25:
+                if torch.rand(1).item() < 0.50:
                     latent = torch.randn_like(pc_latent) + 0.0 * pc_latent
                 else:
-                    noise_reg = torch.randn_like(pc_latent) * 0.30
+                    noise_reg = torch.randn_like(pc_latent) * 0.40
                     latent = pc_latent + noise_reg
                 loss = self.compiled_wrapper(x1=z_flat, x0=latent, cond=cond, t=t)
-                reg_loss = torch.mean(pc_latent) ** 2 + (torch.std(pc_latent) - 1) ** 2
-                loss = loss + 0.1 * reg_loss
         else:
             noise = torch.randn_like(z_flat)
             z_noisy = self.model.q_sample(z_flat, t, noise)
