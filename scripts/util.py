@@ -2,6 +2,9 @@ import os
 from PIL import Image as PilImage
 import numpy as np
 import pandas as pd
+from pathlib import Path
+import torch
+import open3d as o3d
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -35,3 +38,9 @@ def get_mesh_from_pc(pointcloud_name):
 
 def count_label_entries(label):
     return len(mapping_shapenet[mapping_shapenet["label"] == label])
+
+def load_pcd_to_tensor(pcd_path: str | Path) -> torch.Tensor:
+    """Load a single .pcd file into a (N, 3) float32 tensor."""
+    pcd = o3d.io.read_point_cloud(str(pcd_path))
+    points = np.asarray(pcd.points, dtype=np.float32)  # (N, 3)
+    return torch.from_numpy(points)

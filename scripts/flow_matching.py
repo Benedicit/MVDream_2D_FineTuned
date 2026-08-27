@@ -1,12 +1,13 @@
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.absolute()))
 import math
 import torch
-import einops
 import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
 from torch import Tensor
-import torch.nn.functional as F
-from typing import Union
 from functools import partial
 from mvdream.ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor
 from torchdiffeq import odeint

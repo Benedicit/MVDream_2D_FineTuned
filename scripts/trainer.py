@@ -3,7 +3,6 @@ import sys
 
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision import transforms
-from transformers import get_cosine_with_min_lr_schedule_with_warmup
 
 working_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, working_dir)
@@ -21,7 +20,7 @@ from mvdream.ldm.models.diffusion.ddim import DDIMSampler
 from mvdream.model_zoo import build_model
 from pc_encoder import PointCloudTransformerSmall, PointCloudToLatent
 from view_renderer import PointRenderer
-from transformers import AutoModelForImageSegmentation
+from transformers import AutoModelForImageSegmentation,get_cosine_with_min_lr_schedule_with_warmup, get_cosine_schedule_with_warmup
 
 from flow_matching import FlowMatching
 
@@ -44,12 +43,13 @@ class LoRATrainer(LightningModule):
                  AZIM_START=0.0,
                  AZIM_SPAN=360.0,
                  num_views=4,
-                 load_from_ckpth: bool = False,
                  ckpt_path="",
                  no_compile=False,
                  lr=1e-4,
                  batch_size=16,
-                 num_epochs=500):
+                 num_epochs=500,
+                 steps_per_epoch = 536,
+                 use_text=True):
         super().__init__()
         self.model = build_model(model_name=model_name)
 
@@ -59,6 +59,8 @@ class LoRATrainer(LightningModule):
         self.lr = lr
         self.batch_size = batch_size
         self.num_epochs = num_epochs
+        self.steps_per_epoch = steps_per_epoch
+        self.use_text = use_text
 
         if flow_matching:
             add_lora_to_all_layers(self.unet, r=lora_rank, alpha=lora_alpha)
@@ -89,10 +91,11 @@ class LoRATrainer(LightningModule):
 
         self.projector = PointCloudTransformerSmall(
             n_self_attn_layers=4,
-            n_cross_attn_layers=2,
+            n_cross_attn_layers=4,
             num_tokens=4,
-            latent_dim=192,
-            n_heads=6,
+            latent_dim=256,
+            n_heads=4,
+            cross_attn_text=False,
         )
         
         for p in self.projector.parameters():
@@ -146,6 +149,7 @@ class LoRATrainer(LightningModule):
         else:
             self.sampler = DDIMSampler(self.model)
             self.latent_projector = None
+
         self.save_hyperparameters()
 
     def configure_optimizers(self):
@@ -161,17 +165,25 @@ class LoRATrainer(LightningModule):
                 lr=self.lr,
                 weight_decay=1e-2,
                 )
-        scheduler = CosineAnnealingLR(
+        """
+        scheduler = get_cosine_with_min_lr_schedule_with_warmup(
             optimizer,
-            T_max=self.num_epochs,
-            eta_min=1e-5
+            num_warmup_steps=3 * self.steps_per_epoch,
+            num_training_steps=self.num_epochs * self.steps_per_epoch,
+            min_lr = 1e-7
+        )
+        """
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=4 * self.steps_per_epoch,
+            num_training_steps=self.num_epochs * self.steps_per_epoch,
         )
 
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "epoch",
+                "interval": "step",
                 "frequency": 1
             },
         }
@@ -251,8 +263,10 @@ class LoRATrainer(LightningModule):
         #t = torch.rand((B * V,), device=self.device)
 
         cameras  = camera_flat.view(camera_flat.shape[0] // V, V, -1)
-        #pc_tokens, pc_latent = self.projector_fwd(pc_feat, pc_feat_mask, cameras)
-        pc_tokens = self.projector_fwd(pc_feat, pc_feat_mask, cameras)
+        # Add some noise to the features to prevent overfitting
+        #pc_feat = pc_feat + torch.randn_like(pc_feat) * 0.15
+
+        pc_tokens = self.projector_fwd(pc_feat, pc_feat_mask, c_text_flat=c_text_flat)
 
         # Random dropout of tokens
         drop_mask = torch.rand(B*V, device=self.device) < 0.1
@@ -260,21 +274,24 @@ class LoRATrainer(LightningModule):
         null_tokens = self.projector.get_null_context(batch_size=B*V)
 
         pc_tokens = torch.where(drop_mask, null_tokens, pc_tokens)
+        if self.use_text:
+            context = torch.cat([c_text_flat, pc_tokens], dim=1)
+        else:
+            context = torch.cat([pc_tokens], dim=1)
 
-        cond = {"context": pc_tokens, "camera": camera_flat, "num_frames": V}
+        cond = {"context": context, "camera": camera_flat, "num_frames": V}
 
         if self.flow_matching:
             if self.start_from_noise:
                 loss = self.compiled_wrapper(x1=z_flat, x0=None, cond=cond, t=t)
             else:
-                # Also add some noise to the features
-                pc_feat = pc_feat + torch.randn_like(pc_feat) * 0.30
+                #pc_feat = pc_feat + torch.randn_like(pc_feat) * 0.30
                 pc_latent = self.latent_projector_fwd(pc_feat, pc_feat_mask, cameras)
                 # Dropout of latent to enhance only the tokens
                 if torch.rand(1).item() < 0.50:
                     latent = torch.randn_like(pc_latent) + 0.0 * pc_latent
                 else:
-                    noise_reg = torch.randn_like(pc_latent) * 0.40
+                    noise_reg = torch.randn_like(pc_latent) * 0.25
                     latent = pc_latent + noise_reg
                 loss = self.compiled_wrapper(x1=z_flat, x0=latent, cond=cond, t=t)
         else:

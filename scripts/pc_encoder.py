@@ -3,6 +3,7 @@ import torch.nn as nn
 import numpy as np
 import utonia
 import torch.nn.functional as F
+from einops import rearrange
 
 class SwiGLU(nn.Module):
     """
@@ -39,7 +40,7 @@ class PointCloudCrossAttnBlock(nn.Module):
         x, _ = self.attn(
             self.norm_q(latent_tokens),
             self.norm_kv(pc_feat),
-            pc_feat,
+            self.norm_kv(pc_feat),
             key_padding_mask=~mask,
             need_weights=False,
         )
@@ -52,15 +53,85 @@ class PointCloudSelfAttnBlock(nn.Module):
     """Cheap self-attention over all latent tokens (16 tokens @ 256-dim)."""
     def __init__(self, latent_dim=256, n_heads=4, dropout=0.0):
         super().__init__()
-        self.norm1  = nn.LayerNorm(latent_dim)
+        self.norm  = nn.LayerNorm(latent_dim)
         self.attn   = nn.MultiheadAttention(latent_dim, n_heads, dropout=dropout, batch_first=True)
         self.norm_ff = nn.LayerNorm(latent_dim)
         self.ff     = SwiGLU(latent_dim, int(latent_dim * 1.5))
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x), x, x, need_weights=False)[0]
+        x = x + self.attn(self.norm(x), self.norm(x), self.norm(x), need_weights=False)[0]
         x = x + self.ff(self.norm_ff(x))
         return x
+
+class CrossViewTokenBlock(nn.Module):
+    """Enforces consistency across views for 1D token sequences."""
+    def __init__(self, latent_dim, num_views=4, n_heads=8):
+        super().__init__()
+        self.num_views = num_views
+        self.norm1 = nn.LayerNorm(latent_dim)
+        self.attn = nn.MultiheadAttention(latent_dim, n_heads, batch_first=True)
+
+        self.norm2 = nn.LayerNorm(latent_dim)
+        '''
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim)
+        )
+        '''
+        self.mlp = SwiGLU(latent_dim, int(latent_dim * 1.5))
+
+    def forward(self, x, num_tokens):
+        # x: [B, V * T, C]
+        B, VT, C = x.shape
+        V = self.num_views
+        T = num_tokens
+
+        res = x
+
+        # 1. Rearrange to sequence views for attention: [B, V*T, C] -> [(B*T), V, C]
+        # This forces token 't' from View 0 to attend ONLY to token 't' in Views 1, 2, 3
+        x_view = rearrange(x, 'b (v t) c -> (b t) v c', v=V, t=T)
+        x_view = self.norm1(x_view)
+
+        # 2. Cross-view attention
+        attn_out, _ = self.attn(x_view, x_view, x_view)
+
+        # 3. Rearrange back to flattened sequence format: [(B*T), V, C] -> [B, V*T, C]
+        x_seq = rearrange(attn_out, '(b t) v c -> b (v t) c', b=B, v=V, t=T)
+        x = res + x_seq
+
+        # 4. Standard FFN refinement
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class PointCloudTextCrossAttnBlock(nn.Module):
+    """Asymmetric cross-attention: queries at latent_dim, keys/values at text_context_dim."""
+    def __init__(self, latent_dim=256, text_context_dim=1024, n_heads=4, dropout=0.0):
+        super().__init__()
+        self.norm_q  = nn.LayerNorm(latent_dim)
+        self.norm_kv = nn.LayerNorm(text_context_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=latent_dim,
+            num_heads=n_heads,
+            kdim=text_context_dim,
+            vdim=text_context_dim,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm_ff = nn.LayerNorm(latent_dim)
+        self.ff = SwiGLU(latent_dim, int(latent_dim * 1.5))
+
+    def forward(self, latent_tokens, c_text):
+        x, _ = self.attn(
+            self.norm_q(latent_tokens),
+            self.norm_kv(c_text),
+            self.norm_kv(c_text),
+            need_weights=False,
+        )
+        latent_tokens = latent_tokens + x
+        latent_tokens = latent_tokens + self.ff(self.norm_ff(latent_tokens))
+        return latent_tokens
 
 class PointCloudTransformerSmall(nn.Module):
     def __init__(
@@ -74,6 +145,7 @@ class PointCloudTransformerSmall(nn.Module):
             mvdream_context_size=1024,
             utonia_feat_dim=576,
             token_init_std=0.05,
+            cross_attn_text=True,
     ):
         super().__init__()
         self.num_views = num_views
@@ -103,13 +175,19 @@ class PointCloudTransformerSmall(nn.Module):
 
         self.out_norm = nn.LayerNorm(latent_dim)
         self.up_proj = nn.Linear(latent_dim, mvdream_context_size)
+        self.cross_attn_text = cross_attn_text
+
+        if cross_attn_text:
+            self.text_cross_attn = PointCloudTextCrossAttnBlock(latent_dim, mvdream_context_size, n_heads)
+        #self.cross_view_attn = CrossViewTokenBlock(latent_dim, num_views, n_heads)
+        self.final_attn = PointCloudSelfAttnBlock(latent_dim, n_heads)
 
         self.register_buffer('null_context', torch.zeros(1, num_tokens, mvdream_context_size))
 
     def get_null_context(self, batch_size):
         return self.null_context.expand(batch_size, -1, -1)
 
-    def forward(self, pc_feat, mask, cameras):
+    def forward(self, pc_feat, mask, c_text_flat):
 
         B = pc_feat.shape[0]
         V = self.num_views
@@ -124,8 +202,18 @@ class PointCloudTransformerSmall(nn.Module):
         # self-attn -> cross-attn -> self-attn -> self-attn -> cross-attn -> ... -> self-attn
         for i in range(len(self.self_attn_layers)):
             latent_tokens = self.self_attn_layers[i](latent_tokens)
+            latent_tokens = self.cross_attn_layers[i](latent_tokens, pc_feat, mask)
+            """
             if i % 2 == 0 and i < self.n_cross_attn_layers:
                 latent_tokens = self.cross_attn_layers[i // 2](latent_tokens, pc_feat, mask)
+            """
+
+        if self.cross_attn_text:
+            c_text_b = c_text_flat.view(B, V, c_text_flat.shape[1], c_text_flat.shape[2])[:, 0, :, :]
+            latent_tokens = self.text_cross_attn(latent_tokens, c_text_b)
+
+        #latent_tokens = self.cross_view_attn(latent_tokens, T)
+        latent_tokens = self.final_attn(latent_tokens)
 
         x = self.out_norm(latent_tokens)
         out = self.up_proj(x)  # [B, V * T, 1024]
@@ -190,6 +278,7 @@ class PointCloudToLatent(nn.Module):
                 self.view_tokens.expand(B, V, H * W, -1) +
                 self.spatial_tokens .expand(B, V, H * W, -1)
         )
+
 
         tokens = tokens.view(B, V * H * W, -1)
 
