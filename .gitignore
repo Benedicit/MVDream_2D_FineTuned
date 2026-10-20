@@ -159,6 +159,9 @@ debug/
 debug2/
 debug_3D/
 *.png
+*.txt
 logs/
 
 *.sbatch
+*.obj
+*.pdf

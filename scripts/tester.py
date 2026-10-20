@@ -169,8 +169,8 @@ class Tester3D:
         c_text = self.model.get_learned_conditioning([prompt] * num_views).to(self.device)   # [V,L,C]
         uc_text = self.model.get_learned_conditioning([""] * num_views).to(self.device)     # [V,L,C]
         if pcn:
-            #flat_points = load_pcd_to_tensor(pointcloud_path)
-            flat_points,_ = load_ply(pointcloud_path)
+            flat_points = load_pcd_to_tensor(pointcloud_path)
+            #flat_points,_ = load_ply(pointcloud_path)
             flat_normals = torch.zeros_like(flat_points)
 
         else:
@@ -314,7 +314,6 @@ class Tester3D:
             if type(value) is torch.Tensor:
                 data_batch[key] = value.unsqueeze(0).cuda(self.device, non_blocking=True)
 
-
         # set up cameras for mesh rendering
         num_frames, fov_deg, cam_distance = 50, 50, 3.5
         azimuth_deg = torch.from_numpy(np.linspace(0, 360, num=num_frames, endpoint=False, dtype=np.float32))
@@ -401,7 +400,9 @@ class Tester3D:
 
 
     def save_4_views(self, images_np, out_dir: str, dist=2.5, fov_deg=50.0, use_ben2=True):
-        out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
         V, H, W, C = images_np.shape
         assert C == 3
 
@@ -505,7 +506,7 @@ def make_gt_of_sample_list(tester : Tester3D, samples, elev_deg=15.0, debug_dir:
     obj_cache = {}
     for sample in samples:
         if pcn:
-            rel        = sample.relative_to(Path(root_dir) / "data/.pcn/ShapeNetCompletion/val/partial")  # synset_id/obj_id/00.pcd
+            rel        = sample.relative_to(Path(root_dir) / "data/.pcn/ShapeNetCompletion/test/partial")  # synset_id/obj_id/00.pcd
             synset_id  = rel.parts[0]
             obj_id     = rel.parts[1]
             if obj_id not in obj_cache:

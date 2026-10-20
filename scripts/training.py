@@ -91,10 +91,10 @@ def train(ckpt_path=None):
                    ]
 
     model = LoRATrainer(
-        #lora_rank=80,
-        lora_rank=32,
-        #lora_alpha=20.0,
-        lora_alpha=8.0,
+        lora_rank=64,
+        #lora_rank=32,
+        lora_alpha=16.0,
+        #lora_alpha=8.0,
         num_views=4,
         H=256, W=256,
         ELEV_DEG=15.0,
@@ -130,7 +130,7 @@ def train(ckpt_path=None):
     checkpoint_callback = ModelCheckpoint(
         dirpath="checkpoints/",
         #filename=f"shapedream_{suffix}_{len(class_names)}_classes_{num_samples}_big_proj",
-        filename=f"shapedream_32_lora",
+        filename=f"shapedream_384_latent",
         monitor=None,
         save_weights_only=False,
         every_n_epochs=min(num_epochs, 10),
@@ -145,7 +145,7 @@ def train(ckpt_path=None):
         precision="bf16-mixed",
         accelerator="gpu",
         devices="auto",
-        logger=TensorBoardLogger(save_dir="logs", name="paper"),
+        logger=TensorBoardLogger(save_dir="logs", name="384_latent"),
         callbacks=[checkpoint_callback, TQDMProgressBar(refresh_rate=20), lr_monitor],
         log_every_n_steps=50,
         num_sanity_val_steps=0,

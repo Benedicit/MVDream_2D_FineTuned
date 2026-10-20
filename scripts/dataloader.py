@@ -156,7 +156,7 @@ class PCNDataModule(L.LightningDataModule):
         self._camera     = camera
         self.device      = device
 
-        train_path = os.path.join(self.cache_dir, "train_cache_pcn.pt")
+        train_path = os.path.join(self.cache_dir, "train_cache_pcn_lol.pt")
 
         if not os.path.exists(train_path):
             os.makedirs(self.cache_dir, exist_ok=True)
@@ -197,7 +197,7 @@ class PCNDataModule(L.LightningDataModule):
             synset_id  = rel.parts[0]
             obj_id     = rel.parts[1]
             counter = obj_counter.get(obj_id, 0)
-            if counter > 0:
+            if counter > 1:
                 continue
             counter += 1
             obj_counter[obj_id] = counter

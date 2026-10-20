@@ -83,6 +83,7 @@ def generate_partial_shapes(
         use_fps: bool = False,
         device: str | torch.device | None = None,
         seed: int | None = None,
+        add_noise: bool = False,
 ) -> dict[str, str]:
     """
     Write one partial cloud per complete cloud to `base_path/<obj_id>.pc`, and return
@@ -163,6 +164,11 @@ def generate_partial_shapes(
                 partial = partial[idx[:n_points].to(device)]
 
             path = os.path.join(base_path, f"{obj_id}.ply")
+
+            if add_noise:
+                noise = torch.randn_like(partial) * 0.05
+                partial += noise
+
             save_ply(path, partial)
             written[obj_id] = path
             progressbar.update(1)
